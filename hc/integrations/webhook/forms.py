@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from django import forms
 from django.core.exceptions import ValidationError
@@ -54,6 +55,18 @@ class HeadersField(forms.Field):
 
 class WebhookForm(forms.Form):
     error_css_class = "has-error"
+
+    # Fields that carry credentials (callback URLs and custom headers) and are
+    # encrypted at rest. On the encrypted edit form they are not pre-filled;
+    # submitting them blank keeps the previously stored values.
+    SENSITIVE_FIELDS = ("url_down", "url_up", "headers_down", "headers_up")
+
+    def __init__(self, *args: Any, merge_existing: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # When True, blank sensitive fields are kept from the stored record
+        # instead of being treated as cleared values.
+        self.merge_existing = merge_existing
+
     name = forms.CharField(max_length=100, required=False)
 
     method_down = forms.ChoiceField(initial="GET", choices=_choices("GET,POST,PUT"))
@@ -72,9 +85,16 @@ class WebhookForm(forms.Form):
         url_down = self.cleaned_data.get("url_down")
         url_up = self.cleaned_data.get("url_up")
 
-        if not url_down and not url_up:
+        if not url_down and not url_up and not self.merge_existing:
             if not self.has_error("url_down"):
                 self.add_error("url_down", "Enter a valid URL.")
 
-    def get_value(self) -> str:
-        return json.dumps(dict(self.cleaned_data), sort_keys=True)
+    def get_value(self, existing: dict[str, Any] | None = None) -> str:
+        data = dict(self.cleaned_data)
+        if existing is not None:
+            # On the encrypted edit form, blank URL/header fields mean
+            # "keep the already configured value".
+            for name in self.SENSITIVE_FIELDS:
+                if not data[name]:
+                    data[name] = existing[name]
+        return json.dumps(data, sort_keys=True)

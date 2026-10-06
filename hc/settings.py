@@ -446,6 +446,15 @@ INTEGRATIONS_ALLOW_PRIVATE_IPS = envbool("INTEGRATIONS_ALLOW_PRIVATE_IPS", "Fals
 # Zulip
 ZULIP_ENABLED = envbool("ZULIP_ENABLED", "True")
 
+# Encryption of notification channel credentials (tokens, webhook URLs, headers)
+CREDENTIALS_ENCRYPTION = envbool("CREDENTIALS_ENCRYPTION", "False")
+CREDENTIALS_ALGORITHM = os.getenv("CREDENTIALS_ALGORITHM", "A256GCM")
+CREDENTIALS_KEY_ID = os.getenv("CREDENTIALS_KEY_ID")
+CREDENTIALS_KEY = envsecret("CREDENTIALS_KEY")
+# JSON list of previous keys, e.g. [{"id": "old", "alg": "A256GCM", "key": "..."}]
+CREDENTIALS_OLD_KEYS = os.getenv("CREDENTIALS_OLD_KEYS")
+CREDENTIALS_AUDIT_RETENTION_DAYS = envint("CREDENTIALS_AUDIT_RETENTION_DAYS", "365")
+
 # Read additional configuration from hc/local_settings.py if it exists
 if (BASE_DIR / "hc/local_settings.py").exists():
     from .local_settings import *

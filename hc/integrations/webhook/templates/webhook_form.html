@@ -66,11 +66,17 @@
                         value="{{ form.url_down.value|default:"" }}"
                         type="text"
                         class="form-control"
+                        autocomplete="off"
                         placeholder="https://..." />
                 </div>
                 {% if form.url_down.errors %}
                 <div class="help-block">
                     {{ form.url_down.errors|join:" " }}
+                </div>
+                {% elif credentials_encrypted and configured.url_down %}
+                <div class="help-block">
+                    A URL is already set. Enter a new URL to replace it, or leave
+                    this field blank to keep using the current URL.
                 </div>
                 {% endif %}
             </div>
@@ -95,12 +101,16 @@
                     class="form-control"
                     rows="3"
                     name="headers_down"
+                    autocomplete="off"
                     placeholder="X-Sample-Header: $NAME has gone down">{{ form.headers_down.value|default:"" }}</textarea>
                 <div class="help-block">
                     {% if form.headers_down.errors %}
-                        {{ form.headers_down.errors|join:" " }}
+                    {{ form.headers_down.errors|join:" " }}
+                    {% elif credentials_encrypted and configured.headers_down %}
+                    Custom headers are already set. Enter new headers to replace
+                    them, or leave this field blank to keep using the current headers.
                     {% else %}
-                        Optional "Header-Name: value" pairs, one pair per line.
+                    Optional "Header-Name: value" pairs, one pair per line.
                     {% endif %}
                 </div>
             </div>
@@ -122,12 +132,18 @@
                         value="{{ form.url_up.value|default:"" }}"
                         type="text"
                         class="form-control"
+                        autocomplete="off"
                         placeholder="https://..." />
                 </div>
 
                 {% if form.url_up.errors %}
                 <div class="help-block">
                     {{ form.url_up.errors|join:" " }}
+                </div>
+                {% elif credentials_encrypted and configured.url_up %}
+                <div class="help-block">
+                    A URL is already set. Enter a new URL to replace it, or leave
+                    this field blank to keep using the current URL.
                 </div>
                 {% endif %}
             </div>
@@ -151,12 +167,16 @@
                     class="form-control"
                     rows="3"
                     name="headers_up"
+                    autocomplete="off"
                     placeholder="X-Sample-Header: $NAME is back up">{{ form.headers_up.value|default:"" }}</textarea>
                 <div class="help-block">
                     {% if form.headers_up.errors %}
-                        {{ form.headers_up.errors|join:" " }}
+                    {{ form.headers_up.errors|join:" " }}
+                    {% elif credentials_encrypted and configured.headers_up %}
+                    Custom headers are already set. Enter new headers to replace
+                    them, or leave this field blank to keep using the current headers.
                     {% else %}
-                        Optional "Header-Name: value" pairs, one pair per line.
+                    Optional "Header-Name: value" pairs, one pair per line.
                     {% endif %}
                 </div>
             </div>

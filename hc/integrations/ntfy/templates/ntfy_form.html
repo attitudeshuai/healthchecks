@@ -65,10 +65,17 @@
                         name="token"
                         type="text"
                         class="form-control"
-                        value="{{ form.token.value|default:'' }}">
+                        value="{{ form.token.value|default:'' }}"
+                        autocomplete="off">
 
                     {% if form.token.errors %}
                     <div class="help-block">{{ form.url.errors|join:"" }}</div>
+                    {% elif credentials_encrypted and token_configured %}
+                    <div class="help-block">
+                        An access token is already set.
+                        Enter a new token to replace it, or leave this field blank
+                        to keep using the current token.
+                    </div>
                     {% else %}
                     <div class="help-block">If publishing to the topic requires an access token, specify it here.</div>
                     {% endif %}

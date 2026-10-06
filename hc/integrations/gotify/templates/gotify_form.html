@@ -91,10 +91,17 @@
                         class="form-control"
                         name="token"
                         value="{{ form.token.value|default:"" }}"
-                        required>
+                        autocomplete="off"
+                        {% if not credentials_encrypted %}required{% endif %}>
 
                     {% if form.token.errors %}
                     <div class="help-block">{{ form.token.errors|join:"" }}</div>
+                    {% elif credentials_encrypted and token_configured %}
+                    <div class="help-block">
+                        An application token is already set.
+                        Enter a new token to replace it, or leave this field blank
+                        to keep using the current token.
+                    </div>
                     {% endif %}
                 </div>
             </div>

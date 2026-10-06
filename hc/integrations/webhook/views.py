@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from uuid import UUID
 
 from django.contrib.auth.decorators import login_required
@@ -12,16 +13,24 @@ from hc.api.models import Channel
 from hc.front.decorators import require_setting
 from hc.front.views import _get_rw_project_for_user
 from hc.integrations.webhook import forms
+from hc.lib.credentials import get_keyring
 
 
 @require_setting("WEBHOOKS_ENABLED")
 def webhook_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     adding = channel._state.adding
+    encrypted = get_keyring().enabled
+    configured: dict[str, bool] = {}
     if request.method == "POST":
-        form = forms.WebhookForm(request.POST)
+        merge_existing = encrypted and not adding
+        form = forms.WebhookForm(request.POST, merge_existing=merge_existing)
         if form.is_valid():
             channel.name = form.cleaned_data["name"]
-            channel.value = form.get_value()
+            existing = None
+            if merge_existing:
+                existing = json.loads(channel.value)
+                channel.audit_credential_access()
+            channel.value = form.get_value(existing)
             channel.save()
 
             if adding:
@@ -30,6 +39,19 @@ def webhook_form(request: HttpRequest, channel: Channel) -> HttpResponse:
             return redirect("hc-channels", channel.project.code)
     elif adding:
         form = forms.WebhookForm()
+    elif encrypted:
+        # URLs and custom headers are not pre-filled. Reading the remaining
+        # fields still requires decrypting the stored record, so audit access.
+        doc = json.loads(channel.value)
+        configured = {name: bool(doc.get(name)) for name in forms.WebhookForm.SENSITIVE_FIELDS}
+        redacted: dict[str, Any] = dict(doc)
+        redacted["url_down"] = ""
+        redacted["url_up"] = ""
+        redacted["headers_down"] = ""
+        redacted["headers_up"] = ""
+        redacted["name"] = channel.name
+        form = forms.WebhookForm(redacted, merge_existing=True)
+        channel.audit_credential_access()
     else:
 
         def flatten(d: dict[str, str]) -> str:
@@ -40,12 +62,15 @@ def webhook_form(request: HttpRequest, channel: Channel) -> HttpResponse:
         doc["headers_up"] = flatten(doc["headers_up"])
         doc["name"] = channel.name
         form = forms.WebhookForm(doc)
+        configured = {}
 
     ctx = {
         "page": "channels",
         "project": channel.project,
         "form": form,
         "is_new": adding,
+        "credentials_encrypted": encrypted and not adding,
+        "configured": configured,
     }
     return render(request, "webhook_form.html", ctx)
 

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from datetime import timedelta as td
 from importlib import import_module
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 from cronsim import CronSim
@@ -21,6 +21,7 @@ from django.core.mail import mail_admins
 from django.core.signing import TimestampSigner
 from django.db import IntegrityError, models, transaction
 from django.db.models import F, QuerySet
+from django.db.models.query_utils import DeferredAttribute
 from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.functional import cached_property
@@ -30,7 +31,9 @@ from pydantic import BaseModel, Field
 
 from hc.accounts.models import Project
 from hc.api import transports
+from hc.lib import crypto
 from hc.lib import emails
+from hc.lib.credentials import get_keyring
 from hc.lib.date import month_boundaries, seconds_in_month
 from hc.lib.s3 import GetObjectError, get_object, put_object, remove_objects
 from hc.lib.urls import absolute_reverse
@@ -1015,13 +1018,60 @@ class GotifyConf(BaseModel):
         return ", ".join(parts)
 
 
+class CredentialValueDescriptor(DeferredAttribute):
+    """Lazily decrypts Channel.value when it is stored as an envelope.
+
+    The database column always contains either the plaintext value
+    (encryption disabled) or an opaque encrypted envelope. This descriptor
+    keeps the raw value in instance.__dict__ and decrypts transparently on
+    access, so all existing readers of Channel.value keep working unchanged.
+    """
+
+    def __get__(
+        self, instance: models.Model | None, owner: type[models.Model] | None = None
+    ) -> str:
+        if instance is None:
+            return cast(str, super().__get__(instance, owner))
+
+        raw = str(super().__get__(instance, owner))
+        if not crypto.is_envelope(raw):
+            return raw
+
+        cached = instance.__dict__.get("_cred_plain")
+        if cached is not None and cached[0] == raw:
+            return str(cached[1])
+
+        plaintext, key = get_keyring().decrypt_record(raw)
+        instance.__dict__["_cred_plain"] = (raw, plaintext, key.id if key else "")
+        return plaintext
+
+    def __set__(self, instance: models.Model, value: Any) -> None:
+        # A newly assigned value is plaintext; drop any stale decryption cache.
+        instance.__dict__["_cred_plain"] = None
+        instance.__dict__[self.field.attname] = value
+
+
+class CredentialField(models.TextField[str, str]):
+    """TextField whose stored value may be an encrypted credential envelope."""
+
+    descriptor_class = CredentialValueDescriptor
+
+    def pre_save(self, model_instance: models.Model, add: bool) -> str:
+        # Return the raw stored value (plaintext or encrypted envelope)
+        # without triggering the descriptor's transparent decryption.
+        attname = self.attname
+        if attname not in model_instance.__dict__:
+            return str(getattr(model_instance, attname))
+        return str(model_instance.__dict__[attname])
+
+
 class Channel(models.Model):
     name = models.CharField(max_length=100, blank=True)
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     project = models.ForeignKey(Project, models.CASCADE)
     created = models.DateTimeField(default=now)
     kind = models.CharField(max_length=20, choices=CHANNEL_KINDS)
-    value = models.TextField(blank=True)
+    value = CredentialField(blank=True)
     email_verified = models.BooleanField(default=False)
     disabled = models.BooleanField(default=False)
     last_notify = models.DateTimeField(null=True, blank=True)
@@ -1050,6 +1100,86 @@ class Channel(models.Model):
 
     def to_dict(self) -> dict[str, str]:
         return {"id": str(self.code), "name": self.name, "kind": self.kind}
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        """Encrypt the credential value before writing when encryption is on."""
+
+        keyring = get_keyring()
+        raw = self.__dict__.get("value", "")
+        if (
+            keyring.enabled
+            and isinstance(raw, str)
+            and raw
+            and not crypto.is_envelope(raw)
+        ):
+            envelope = keyring.encrypt(raw)
+            self.__dict__["value"] = envelope
+            try:
+                super().save(*args, **kwargs)
+            finally:
+                # Keep serving plaintext to the running process; only the
+                # database row must contain the envelope.
+                self.__dict__["value"] = raw
+
+            kid = keyring.current.id if keyring.current else ""
+            self.__dict__["_cred_plain"] = (envelope, raw, kid)
+            return
+
+        super().save(*args, **kwargs)
+
+    def refresh_from_db(self, *args: Any, **kwargs: Any) -> None:
+        super().refresh_from_db(*args, **kwargs)
+        self.__dict__.pop("_cred_plain", None)
+
+    def stored_envelope(self) -> str | None:
+        """Return the encrypted envelope as stored in the database, or None.
+
+        Does not decrypt the value.
+        """
+
+        raw = self.__dict__.get("value")
+        if isinstance(raw, str) and crypto.is_envelope(raw):
+            return raw
+
+        cached = self.__dict__.get("_cred_plain")
+        if cached is not None:
+            envelope = cached[0]
+            assert isinstance(envelope, str)
+            return envelope
+
+        return None
+
+    def credential_key_id(self) -> str:
+        """Return the key id of the stored credential, or "" if unencrypted."""
+
+        envelope = self.stored_envelope()
+        if envelope is None:
+            return ""
+        return crypto.parse_envelope(envelope).key_id
+
+    def audit_credential_access(self) -> None:
+        """Record a credential read for the access audit log.
+
+        Only logs when this instance has actually decrypted a stored
+        envelope. Reads with the current key are recorded as "read", reads
+        that had to fall back to an old (rotated) key as "decrypt".
+        """
+
+        # The descriptor populates "_cred_plain" on successful decryption.
+        if self.__dict__.get("_cred_plain") is None:
+            return
+
+        envelope = self.stored_envelope()
+        if envelope is None:
+            return
+
+        key_id = crypto.parse_envelope(envelope).key_id
+        current = get_keyring().current
+        action = CredentialAccess.READ
+        if current is not None and key_id != current.id:
+            action = CredentialAccess.DECRYPT
+
+        CredentialAccess.objects.record(self, action, key_id)
 
     def is_editable(self) -> bool:
         return self.kind in (
@@ -1149,7 +1279,17 @@ class Channel(models.Model):
         return cls(self)
 
     def notify(self, flip: Flip, is_test: bool = False) -> str:
-        if self.transport.is_noop(flip.new_status):
+        credential_error: str | None = None
+        try:
+            noop = self.transport.is_noop(flip.new_status)
+        except crypto.CredentialError as e:
+            # Credentials could not be decrypted. Report a clear error, but do
+            # not disable the channel or modify the stored record.
+            noop = False
+            credential_error = str(e)
+
+        if noop:
+            self.audit_credential_access()
             return "no-op"
 
         n = Notification(channel=self)
@@ -1168,12 +1308,21 @@ class Channel(models.Model):
             return "Channel or check does not exist any more"
 
         start, error, disabled = now(), "", self.disabled
-        try:
-            self.transport.notify(flip, notification=n)
+        if credential_error is not None:
+            # is_noop() already proved the credentials cannot be decrypted.
+            # Never auto-disable the channel or modify the stored record.
+            error = credential_error
+        else:
+            try:
+                self.transport.notify(flip, notification=n)
 
-        except transports.TransportError as e:
-            disabled = True if e.permanent else disabled
-            error = e.message
+            except transports.TransportError as e:
+                disabled = True if e.permanent else disabled
+                error = e.message
+            except crypto.CredentialError as e:
+                # Never auto-disable a channel just because its credentials
+                # could not be decrypted (missing key during rotation, etc.)
+                error = str(e)
 
         Notification.objects.filter(id=n.id).update(error=error)
         Channel.objects.filter(id=self.id).update(
@@ -1182,6 +1331,9 @@ class Channel(models.Model):
             last_error=error,
             disabled=disabled,
         )
+
+        if not error:
+            self.audit_credential_access()
 
         return error
 
@@ -1335,6 +1487,62 @@ class Channel(models.Model):
         return NtfyConf.model_validate_json(self.value, strict=True)
 
 
+class CredentialAccessManager(models.Manager["CredentialAccess"]):
+    def record(
+        self, channel: Channel, action: str, key_id: str = ""
+    ) -> CredentialAccess:
+        return self.create(channel=channel, action=action, key_id=key_id)
+
+    def for_channel(
+        self,
+        channel: Channel,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> QuerySet[CredentialAccess]:
+        qs = self.filter(channel=channel)
+        if since is not None:
+            qs = qs.filter(created__gte=since)
+        if until is not None:
+            qs = qs.filter(created__lte=until)
+        return qs.order_by("created")
+
+    def prune(self, retention_days: int) -> int:
+        threshold = now() - td(days=retention_days)
+        deleted, _ = self.filter(created__lt=threshold).delete()
+        return deleted
+
+
+class CredentialAccess(models.Model):
+    """Audit record of channel credential access.
+
+    Stores only the channel identifier, the action, timestamp and the key id
+    used; credential contents are never recorded.
+    """
+
+    READ = "read"  # credentials read with the current key
+    DECRYPT = "decrypt"  # credentials read with an old (rotated) key
+    ROTATE = "rotate"  # re-encrypted to the current key
+    ACTIONS = (
+        (READ, "Read"),
+        (DECRYPT, "Decrypt with old key"),
+        (ROTATE, "Rotate"),
+    )
+
+    channel = models.ForeignKey(Channel, models.CASCADE)
+    action = models.CharField(max_length=10, choices=ACTIONS)
+    key_id = models.CharField(max_length=64, blank=True)
+    created = models.DateTimeField(default=now)
+
+    objects: CredentialAccessManager = CredentialAccessManager()
+
+    class Meta:
+        indexes = (
+            models.Index(fields=["channel", "created"], name="api_credacc_channel"),
+            models.Index(fields=["created"], name="api_credacc_created"),
+        )
+
+
 class Notification(models.Model):
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     # owner is null for test notifications, produced by the "Test!" button
@@ -1405,7 +1613,20 @@ class Flip(models.Model):
 
         q = self.owner.channel_set.exclude(disabled=True)
         q = q.order_by(F("last_notify_duration").asc(nulls_last=True))
-        return [ch for ch in q if not ch.transport.is_noop(self.new_status)]
+
+        result = []
+        for ch in q:
+            try:
+                noop = ch.transport.is_noop(self.new_status)
+            except crypto.CredentialError:
+                # The channel's credentials cannot be decrypted. Keep it in
+                # the list instead of aborting the whole flip: notify() will
+                # report a clear per-channel error, other channels still send.
+                noop = False
+            if not noop:
+                result.append(ch)
+
+        return result
 
     def reason_long(self) -> str | None:
         if self.reason == "timeout":

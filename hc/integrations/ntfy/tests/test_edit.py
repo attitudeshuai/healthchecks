@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import base64
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from django.test import override_settings
 
 from hc.api.models import Channel, Check
+from hc.lib.credentials import reset_keyring
 from hc.test import BaseTestCase
+
+
+@contextmanager
+def use_encryption() -> Iterator[None]:
+    key = base64.urlsafe_b64encode(b"k" * 32).decode()
+    with override_settings(
+        CREDENTIALS_ENCRYPTION=True,
+        CREDENTIALS_ALGORITHM="A256GCM",
+        CREDENTIALS_KEY_ID="current",
+        CREDENTIALS_KEY=key,
+        CREDENTIALS_OLD_KEYS=None,
+        CREDENTIALS_AUDIT_RETENTION_DAYS=365,
+    ):
+        reset_keyring()
+        try:
+            yield
+        finally:
+            reset_keyring()
 
 
 class EditNtfyTestCase(BaseTestCase):
@@ -76,3 +100,45 @@ class EditNtfyTestCase(BaseTestCase):
 
         self.channel.refresh_from_db()
         self.assertEqual(self.channel.ntfy.token, "tk_test")
+
+
+class EncryptedEditNtfyTestCase(BaseTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.check = Check.objects.create(project=self.project)
+        self._encryption = use_encryption()
+        self._encryption.__enter__()
+        self.addCleanup(self._encryption.__exit__, None, None, None)
+
+        self.channel = Channel(project=self.project, kind="ntfy")
+        self.channel.value = json.dumps(
+            {
+                "topic": "foo-bar-baz",
+                "url": "https://example.org",
+                "priority": 3,
+                "priority_up": 0,
+                "token": "test-token",
+            }
+        )
+        self.channel.save()
+        self.url = f"/integrations/{self.channel.code}/edit/"
+        self.client.login(username="alice@example.org", password="password")
+
+    def test_it_does_not_refill_token(self) -> None:
+        r = self.client.get(self.url)
+        self.assertNotContains(r, "test-token")
+        self.assertContains(r, "already set")
+        self.assertContains(r, "foo-bar-baz")
+
+    def test_blank_token_keeps_existing_value(self) -> None:
+        form = {
+            "topic": "foo-bar-baz",
+            "url": "https://example.org",
+            "priority": "3",
+            "priority_up": "0",
+        }
+        r = self.client.post(self.url, form)
+        self.assertRedirects(r, self.channels_url)
+
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.ntfy.token, "test-token")

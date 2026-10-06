@@ -79,6 +79,19 @@ def settings_check(
             )
         )
 
+    if getattr(settings, "CREDENTIALS_ENCRYPTION", False):
+        from hc.lib.credentials import validate_settings
+
+        for msg, hint in validate_settings(
+            enabled=True,
+            algorithm=settings.CREDENTIALS_ALGORITHM,
+            current_id=settings.CREDENTIALS_KEY_ID,
+            current_key=settings.CREDENTIALS_KEY,
+            old_keys_raw=settings.CREDENTIALS_OLD_KEYS,
+            retention_days=settings.CREDENTIALS_AUDIT_RETENTION_DAYS,
+        ):
+            items.append(Error(msg, hint=hint, id="hc.api.E004"))
+
     return items
 
 

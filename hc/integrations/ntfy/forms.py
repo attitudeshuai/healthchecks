@@ -42,5 +42,10 @@ class NtfyForm(forms.Form):
         choices=PRIORITY_CHOICES, coerce=int, initial=3
     )
 
-    def get_value(self) -> str:
-        return json.dumps(dict(self.cleaned_data), sort_keys=True)
+    def get_value(self, existing_token: str | None = None) -> str:
+        data = dict(self.cleaned_data)
+        # On the edit form the token is not pre-filled. A blank submitted token
+        # means "keep using the already stored token".
+        if existing_token is not None and not data["token"]:
+            data["token"] = existing_token
+        return json.dumps(data, sort_keys=True)
