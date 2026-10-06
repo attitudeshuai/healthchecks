@@ -141,6 +141,70 @@ Aside from the comma-separated syntax, this is a standard Django setting.
 Read more about it in the
 [Django documentation](https://docs.djangoproject.com/en/6.1/ref/settings/#allowed-hosts).
 
+## `API_KEY_ROTATION_ENABLED` {: #API_KEY_ROTATION_ENABLED }
+
+Default: `False`
+
+A boolean that turns on API key rotation and governance. When enabled, the
+project's read-write and read-only API keys gain:
+
+* rotation with a transition window (the old key keeps working alongside the
+  new key until the window ends),
+* per-key generation time, first/last usage time, last usage source and
+  request counters, visible in Project Settings,
+* an audit log of accepted and rejected authentication attempts (rejections
+  are grouped by key prefix),
+* the `pruneapikeys` management command which ends open windows and
+  deletes expired audit records.
+
+When disabled (the default), API keys work exactly as before: one value per
+slot, overwritten on regeneration, no audit records.
+
+## `API_KEY_ROTATION_WINDOW` {: #API_KEY_ROTATION_WINDOW }
+
+Default: `86400`
+
+Duration of the rotation transition window, in seconds. After a key rotation,
+the previous key remains valid for this long. The default is one day.
+
+## `API_KEY_EXPIRATION_ENABLED` {: #API_KEY_EXPIRATION_ENABLED }
+
+Default: `False`
+
+A boolean that turns on API key expiry. Requires `API_KEY_ROTATION_ENABLED`
+to be enabled. When on, newly generated keys receive an expiry time
+(`API_KEY_LIFETIME`).
+
+## `API_KEY_LIFETIME` {: #API_KEY_LIFETIME }
+
+Default: `7776000`
+
+The lifetime of a newly generated API key, in seconds, when
+`API_KEY_EXPIRATION_ENABLED` is on. The default is 90 days.
+
+## `API_KEY_EXPIRATION_GRACE` {: #API_KEY_EXPIRATION_GRACE }
+
+Default: `604800`
+
+The grace period after an API key expires, in seconds. During the grace
+period the key is still accepted, but the call is flagged as expired in the
+audit log. Afterwards the key is rejected. The default is 7 days.
+
+## `API_KEY_AUDIT_RETENTION` {: #API_KEY_AUDIT_RETENTION }
+
+Default: `2592000`
+
+How long API key audit records are kept, in seconds. The `pruneapikeys`
+management command deletes older records. The default is 30 days.
+
+## `API_KEY_PRUNE_SCAN_PERIOD` {: #API_KEY_PRUNE_SCAN_PERIOD }
+
+Default: `86400`
+
+How often the `pruneapikeys` command is scheduled to run, in seconds. It must
+not be shorter than `API_KEY_ROTATION_WINDOW`, otherwise Healthchecks refuses
+to start. The default is one day.
+
 ## `APPRISE_ENABLED` {: #APPRISE_ENABLED }
 
 Default: `False`

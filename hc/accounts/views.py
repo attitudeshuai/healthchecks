@@ -17,6 +17,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
 from django.db import transaction
+from django.db.models import Count, Max
 from django.db.models.functions import Lower
 from django.http import (
     HttpRequest,
@@ -35,7 +36,15 @@ from django.views.decorators.http import require_POST
 from hc.accounts import forms
 from hc.accounts.decorators import require_sudo_mode
 from hc.accounts.http import AuthenticatedHttpRequest
-from hc.accounts.models import Credential, Member, Profile, Project
+from hc.accounts.models import (
+    ApiKeyAudit,
+    ApiKeyCredential,
+    ApiKeyError,
+    Credential,
+    Member,
+    Profile,
+    Project,
+)
 from hc.api.models import Channel, Check, TokenBucket
 from hc.lib.tz import all_timezones
 from hc.lib.webauthn import CreateHelper, GetHelper
@@ -382,17 +391,72 @@ def project(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     }
 
     if request.method == "POST":
-        if "create_key" in request.POST:
+        governance = settings.API_KEY_ROTATION_ENABLED
+
+        if "rotate_key" in request.POST:
+            if not governance or not rw:
+                return HttpResponseForbidden()
+
+            slot = request.POST["rotate_key"]
+            if slot not in ("api_key", "api_key_readonly"):
+                return HttpResponseBadRequest()
+
+            try:
+                ctx["new_key"] = project.start_key_rotation(slot)
+            except ApiKeyError as e:
+                ctx["key_error"] = str(e)
+                return HttpResponseBadRequest(
+                    render(request, "accounts/project.html", ctx)
+                )
+
+            ctx["key_created"] = True
+            ctx["api_status"] = "success"
+        elif "finish_rotation" in request.POST:
+            if not governance or not rw:
+                return HttpResponseForbidden()
+
+            slot = request.POST["finish_rotation"]
+            if slot not in ("api_key", "api_key_readonly"):
+                return HttpResponseBadRequest()
+
+            project.finish_key_rotation(slot)
+            ctx["key_revoked"] = True
+            ctx["api_status"] = "info"
+        elif "revoke_old_key" in request.POST:
+            if not governance or not rw:
+                return HttpResponseForbidden()
+
+            slot = request.POST["revoke_old_key"]
+            if slot not in ("api_key", "api_key_readonly"):
+                return HttpResponseBadRequest()
+
+            project.revoke_previous_key(slot)
+            ctx["key_revoked"] = True
+            ctx["api_status"] = "info"
+        elif "create_key" in request.POST:
             if not rw:
                 return HttpResponseForbidden()
 
-            if request.POST["create_key"] == "api_key":
-                ctx["new_key"] = project.set_api_key()
-            elif request.POST["create_key"] == "api_key_readonly":
-                ctx["new_key"] = project.set_api_key_readonly()
-            elif request.POST["create_key"] == "ping_key":
-                ctx["new_ping_key"] = project.set_ping_key()
-            project.save()
+            if governance and request.POST["create_key"] in (
+                "api_key",
+                "api_key_readonly",
+            ):
+                slot = request.POST["create_key"]
+                try:
+                    ctx["new_key"] = project.create_api_credential(slot)
+                except ApiKeyError as e:
+                    ctx["key_error"] = str(e)
+                    return HttpResponseBadRequest(
+                        render(request, "accounts/project.html", ctx)
+                    )
+            else:
+                if request.POST["create_key"] == "api_key":
+                    ctx["new_key"] = project.set_api_key()
+                elif request.POST["create_key"] == "api_key_readonly":
+                    ctx["new_key"] = project.set_api_key_readonly()
+                elif request.POST["create_key"] == "ping_key":
+                    ctx["new_ping_key"] = project.set_ping_key()
+                project.save()
 
             ctx["key_created"] = True
             ctx["api_status"] = "success"
@@ -400,13 +464,19 @@ def project(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
             if not rw:
                 return HttpResponseForbidden()
 
-            if request.POST["revoke_key"] == "api_key":
-                project.api_key = ""
-            elif request.POST["revoke_key"] == "api_key_readonly":
-                project.api_key_readonly = ""
-            elif request.POST["revoke_key"] == "ping_key":
-                project.ping_key = None
-            project.save()
+            if governance and request.POST["revoke_key"] in (
+                "api_key",
+                "api_key_readonly",
+            ):
+                project.revoke_current_key(request.POST["revoke_key"])
+            else:
+                if request.POST["revoke_key"] == "api_key":
+                    project.api_key = ""
+                elif request.POST["revoke_key"] == "api_key_readonly":
+                    project.api_key_readonly = ""
+                elif request.POST["revoke_key"] == "ping_key":
+                    project.ping_key = None
+                project.save()
 
             ctx["key_revoked"] = True
             ctx["api_status"] = "info"
@@ -539,6 +609,37 @@ def project(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
 
     mq = project.member_set.select_related("user").order_by("user__email")
     ctx["memberships"] = list(mq)
+
+    if settings.API_KEY_ROTATION_ENABLED:
+        credentials: dict[str, dict[str, ApiKeyCredential]] = {
+            ApiKeyCredential.Slot.RW: {},
+            ApiKeyCredential.Slot.RO: {},
+        }
+        cred_qs = project.api_key_credentials.filter(
+            status__in=(
+                ApiKeyCredential.Status.CURRENT,
+                ApiKeyCredential.Status.PREVIOUS,
+            )
+        )
+        for credential in cred_qs:
+            credentials[credential.slot][credential.status] = credential
+
+        ctx["key_credentials"] = credentials
+        ctx["key_audits"] = list(
+            project.api_key_audits.order_by("-id")[:20]
+        )
+        ctx["key_rejections"] = list(
+            project.api_key_audits.filter(
+                result__in=(
+                    ApiKeyAudit.Result.REJECTED,
+                    ApiKeyAudit.Result.REJECTED_EXPIRED,
+                )
+            )
+            .values("slot", "key_prefix", "generation")
+            .annotate(n=Count("id"), last=Max("created_at"))
+            .order_by("-n")
+        )
+
     return render(request, "accounts/project.html", ctx)
 
 

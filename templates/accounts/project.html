@@ -1,5 +1,5 @@
 {% extends "base_project.html" %}
-{% load compress static hc_extras %}
+{% load compress static hc_extras humanize %}
 
 {% block title %}Project Settings - {{ project }}{% endblock %}
 
@@ -79,11 +79,31 @@
         <div class="panel panel-{{ api_status|default:'default' }}">
             <div class="panel-body settings-block">
                 <h2>API Access</h2>
+                {% if key_error %}
+                <p class="alert alert-danger">{{ key_error }}</p>
+                {% endif %}
                 <table id="api-keys" class="table">
                     <tr>
                         <td>API key</td>
                         <td>
-                            {% if "." in project.api_key %}
+                            {% if key_credentials %}
+                                {% with c=key_credentials.api_key.c %}
+                                {% if c %}
+                                    <code>{{ c.masked }}</code>
+                                    <div class="key-meta">
+                                        Created {{ c.created_at|date:"Y-m-d H:i" }}
+                                        {% if c.expires_at %}&middot; expires {{ c.expires_at|naturaltime }}{% endif %}
+                                        <br>
+                                        Calls: {{ c.call_count }}
+                                        &middot; first used {{ c.first_used_at|naturaltime|default:"never" }}
+                                        &middot; last used {{ c.last_used_at|naturaltime|default:"never" }}
+                                        &middot; source: {% if c.last_source %}{{ c.last_source }}{% else %}&ndash;{% endif %}
+                                    </div>
+                                {% else %}
+                                    <span class="not-set">not set</span>
+                                {% endif %}
+                                {% endwith %}
+                            {% elif "." in project.api_key %}
                                 <code>{{ project.api_key|mask_rw_key }}</code>
                             {% elif project.api_key %}
                                 <code data-plaintext="{{ project.api_key }}">{{ project.api_key|mask_key }}</code>
@@ -92,7 +112,18 @@
                             {% endif %}
                         </td>
                         <td class="text-right">
-                            {% if project.api_key %}
+                            {% if key_credentials %}
+                                {% if key_credentials.api_key.c %}
+                                <a href="#"
+                                   data-rotate-key="api_key"
+                                   data-name="API key">Rotate</a><br>
+                                <a href="#"
+                                   data-revoke-key="api_key"
+                                   data-name="API key">Revoke</a>
+                                {% else %}
+                                <a href="#" data-create-key="api_key">Create</a>
+                                {% endif %}
+                            {% elif project.api_key %}
                             <a href="#"
                                data-revoke-key="api_key"
                                data-name="API key">Revoke</a>
@@ -101,10 +132,49 @@
                             {% endif %}
                         </td>
                     </tr>
+                    {% if key_credentials.api_key.p %}
+                    <tr class="previous-key">
+                        <td>API key (previous)</td>
+                        <td>
+                            <code>{{ key_credentials.api_key.p.masked }}</code>
+                            <div class="key-meta">
+                                Rotation window ends {{ key_credentials.api_key.p.window_expires_at|date:"Y-m-d H:i" }}
+                                <br>
+                                Calls: {{ key_credentials.api_key.p.call_count }}
+                                &middot; last used {{ key_credentials.api_key.p.last_used_at|naturaltime|default:"never" }}
+                            </div>
+                        </td>
+                        <td class="text-right">
+                            <a href="#"
+                               data-finish-key="api_key"
+                               data-name="API key">End window now</a><br>
+                            <a href="#"
+                               data-revoke-old-key="api_key"
+                               data-name="API key">Revoke old key</a>
+                        </td>
+                    </tr>
+                    {% endif %}
                     <tr>
                         <td>API key (read-only)</td>
                         <td>
-                            {% if "." in project.api_key_readonly %}
+                            {% if key_credentials %}
+                                {% with c=key_credentials.api_key_readonly.c %}
+                                {% if c %}
+                                    <code>{{ c.masked }}</code>
+                                    <div class="key-meta">
+                                        Created {{ c.created_at|date:"Y-m-d H:i" }}
+                                        {% if c.expires_at %}&middot; expires {{ c.expires_at|naturaltime }}{% endif %}
+                                        <br>
+                                        Calls: {{ c.call_count }}
+                                        &middot; first used {{ c.first_used_at|naturaltime|default:"never" }}
+                                        &middot; last used {{ c.last_used_at|naturaltime|default:"never" }}
+                                        &middot; source: {% if c.last_source %}{{ c.last_source }}{% else %}&ndash;{% endif %}
+                                    </div>
+                                {% else %}
+                                    <span class="not-set">not set</span>
+                                {% endif %}
+                                {% endwith %}
+                            {% elif "." in project.api_key_readonly %}
                                 <code>{{ project.api_key_readonly|mask_ro_key }}</code>
                             {% elif project.api_key_readonly %}
                                 <code data-plaintext="{{ project.api_key_readonly }}">{{ project.api_key_readonly|mask_key }}</code>
@@ -113,7 +183,18 @@
                             {% endif %}
                         </td>
                         <td class="text-right">
-                            {% if project.api_key_readonly %}
+                            {% if key_credentials %}
+                                {% if key_credentials.api_key_readonly.c %}
+                                <a href="#"
+                                   data-rotate-key="api_key_readonly"
+                                   data-name="read-only API key">Rotate</a><br>
+                                <a href="#"
+                                   data-revoke-key="api_key_readonly"
+                                   data-name="read-only API key">Revoke</a>
+                                {% else %}
+                                <a href="#" data-create-key="api_key_readonly">Create</a>
+                                {% endif %}
+                            {% elif project.api_key_readonly %}
                             <a href="#"
                                data-revoke-key="api_key_readonly"
                                data-name="read-only API key">Revoke</a>
@@ -122,6 +203,28 @@
                             {% endif %}
                         </td>
                     </tr>
+                    {% if key_credentials.api_key_readonly.p %}
+                    <tr class="previous-key">
+                        <td>API key (previous, read-only)</td>
+                        <td>
+                            <code>{{ key_credentials.api_key_readonly.p.masked }}</code>
+                            <div class="key-meta">
+                                Rotation window ends {{ key_credentials.api_key_readonly.p.window_expires_at|date:"Y-m-d H:i" }}
+                                <br>
+                                Calls: {{ key_credentials.api_key_readonly.p.call_count }}
+                                &middot; last used {{ key_credentials.api_key_readonly.p.last_used_at|naturaltime|default:"never" }}
+                            </div>
+                        </td>
+                        <td class="text-right">
+                            <a href="#"
+                               data-finish-key="api_key_readonly"
+                               data-name="read-only API key">End window now</a><br>
+                            <a href="#"
+                               data-revoke-old-key="api_key_readonly"
+                               data-name="read-only API key">Revoke old key</a>
+                        </td>
+                    </tr>
+                    {% endif %}
                     <tr>
                         <td>Ping key</td>
                         <td>
@@ -162,6 +265,66 @@
             </div>
             {% endif %}
         </div>
+
+        {% if key_credentials %}
+        <div class="panel panel-default">
+            <div class="panel-body settings-block">
+                <h2>Key Activity &amp; Audit</h2>
+
+                {% if key_rejections %}
+                <p>Callers still using old or rejected keys:</p>
+                <table id="key-rejections" class="table">
+                    <tr>
+                        <th>Key prefix</th>
+                        <th>Slot</th>
+                        <th>Generation</th>
+                        <th>Rejected calls</th>
+                        <th>Last seen</th>
+                    </tr>
+                    {% for r in key_rejections %}
+                    <tr>
+                        <td><code>{% if r.slot == "api_key_readonly" %}hcr_{% else %}hcw_{% endif %}{{ r.key_prefix }}&hellip;</code></td>
+                        <td>{% if r.slot == "api_key_readonly" %}read-only{% else %}read-write{% endif %}</td>
+                        <td>{{ r.generation }}</td>
+                        <td>{{ r.n }}</td>
+                        <td>{{ r.last|naturaltime }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+                {% endif %}
+
+                <p>Recent authentication events:</p>
+                {% if key_audits %}
+                <table id="key-audits" class="table">
+                    <tr>
+                        <th>When</th>
+                        <th>Slot</th>
+                        <th>Key</th>
+                        <th>Generation</th>
+                        <th>Result</th>
+                        <th>Source</th>
+                    </tr>
+                    {% for a in key_audits %}
+                    <tr>
+                        <td>{{ a.created_at|naturaltime }}</td>
+                        <td>{% if a.slot == "api_key_readonly" %}read-only{% elif a.slot == "api_key" %}read-write{% else %}&ndash;{% endif %}</td>
+                        <td>
+                            {% if a.key_prefix %}
+                                <code>{% if a.slot == "api_key_readonly" %}hcr_{% else %}hcw_{% endif %}{{ a.key_prefix }}&hellip;</code>
+                            {% else %}&ndash;{% endif %}
+                        </td>
+                        <td>{{ a.generation }}</td>
+                        <td>{{ a.get_result_display }}</td>
+                        <td>{{ a.source }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+                {% else %}
+                <p class="not-set">No authentication events recorded yet.</p>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
         {% endif %}
 
         {% with invite_suggestions=project.invite_suggestions %}
@@ -345,6 +508,98 @@
                     <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
                     <button type="submit" class="btn btn-danger">
                         Revoke <span class="name"></span>
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+{% endif %}
+
+{% if rw and key_credentials %}
+<div id="rotate-key-modal" class="modal">
+    <div class="modal-dialog">
+        <form method="post">
+            {% csrf_token %}
+            <input id="rotate-key-type" type="hidden" name="rotate_key">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-dismiss="modal">&times;</button>
+                    <h4>Rotate <span class="name"></span>?</h4>
+                </div>
+                <div class="modal-body">
+                    <p>
+                        A new <span class="name"></span> is generated and shown once.
+                    </p>
+                    <p>
+                        The previous key keeps authenticating until the
+                        transition window ends. Start a second rotation only
+                        after the window has ended.
+                    </p>
+                    <p>Are you sure?</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">
+                        Rotate <span class="name"></span>
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div id="finish-key-modal" class="modal">
+    <div class="modal-dialog">
+        <form method="post">
+            {% csrf_token %}
+            <input id="finish-key-type" type="hidden" name="finish_rotation">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-dismiss="modal">&times;</button>
+                    <h4>End the rotation window for <span class="name"></span>?</h4>
+                </div>
+                <div class="modal-body">
+                    <p>
+                        The previous <span class="name"></span> stops working
+                        immediately. Callers still using it will receive
+                        "unauthorized".
+                    </p>
+                    <p>Are you sure?</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-warning">
+                        End window
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div id="revoke-old-key-modal" class="modal">
+    <div class="modal-dialog">
+        <form method="post">
+            {% csrf_token %}
+            <input id="revoke-old-key-type" type="hidden" name="revoke_old_key">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-dismiss="modal">&times;</button>
+                    <h4>Revoke the old <span class="name"></span>?</h4>
+                </div>
+                <div class="modal-body">
+                    <p>
+                        The previous <span class="name"></span> is revoked and
+                        stops working immediately, before the transition
+                        window ends.
+                    </p>
+                    <p>Are you sure?</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-danger">
+                        Revoke old key
                     </button>
                 </div>
             </div>

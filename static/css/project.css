@@ -6,3 +6,13 @@
 #api-keys code[data-plaintext] {
     cursor: pointer;
 }
+
+#api-keys .key-meta {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+#api-keys tr.previous-key td {
+    background-color: var(--gray-lightest, #f8f8f8);
+}

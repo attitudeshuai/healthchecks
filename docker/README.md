@@ -44,9 +44,9 @@ termination.
 * `migrate`, `sendalerts`, `sendreports`, `smtpd` – when running with Docker, you
   also do  not need to manually run these. They are run automatically on
   container startup (you can find them listed in [uwsgi.ini](https://github.com/healthchecks/healthchecks/blob/master/docker/uwsgi.ini)).
-* `createsuperuser`, `pruneobjects`, `prunetokenbucket`, `pruneusers`,
-  `settelegramwebhook` – you need to run them **inside the container**, not on
-  the host system. Do it like so:
+* `createsuperuser`, `pruneapikeys`, `pruneobjects`, `prunetokenbucket`,
+  `pruneusers`, `settelegramwebhook` – you need to run them **inside the
+  container**, not on the host system. Do it like so:
 
   ```sh
   docker compose run web /opt/healthchecks/manage.py <command>

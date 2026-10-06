@@ -17,7 +17,13 @@ from django.urls import reverse
 from django.utils.html import format_html
 from django_stubs_ext import WithAnnotations
 
-from hc.accounts.models import Credential, Profile, Project
+from hc.accounts.models import (
+    ApiKeyAudit,
+    ApiKeyCredential,
+    Credential,
+    Profile,
+    Project,
+)
 from hc.api.models import Check
 
 Lookups = Iterable[tuple[str, str]]
@@ -341,6 +347,61 @@ class HcUserAdmin(UserAdmin[User]):
             user.save()
 
         self.message_user(request, f"{len(qs)} user(s) deactivated")
+
+
+@admin.register(ApiKeyCredential)
+class ApiKeyCredentialAdmin(ModelAdmin[ApiKeyCredential]):
+    list_display = (
+        "id",
+        "project",
+        "slot",
+        "status",
+        "invalid_reason",
+        "prefix",
+        "created_at",
+        "last_used_at",
+        "call_count",
+    )
+    list_filter = ("slot", "status", "invalid_reason")
+    search_fields = ("project__code", "project__owner__email", "prefix")
+    readonly_fields = (
+        "project",
+        "slot",
+        "key_hash",
+        "prefix",
+        "created_at",
+        "window_expires_at",
+        "expires_at",
+        "first_used_at",
+        "last_used_at",
+        "last_source",
+        "call_count",
+    )
+
+
+@admin.register(ApiKeyAudit)
+class ApiKeyAuditAdmin(ModelAdmin[ApiKeyAudit]):
+    list_display = (
+        "id",
+        "created_at",
+        "project",
+        "slot",
+        "key_prefix",
+        "generation",
+        "result",
+        "source",
+    )
+    list_filter = ("result", "generation", "source", "slot")
+    search_fields = ("project__code", "project__owner__email", "key_prefix")
+    readonly_fields = (
+        "project",
+        "slot",
+        "key_prefix",
+        "generation",
+        "result",
+        "source",
+        "created_at",
+    )
 
 
 @admin.register(Credential)

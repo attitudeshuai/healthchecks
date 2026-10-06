@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import random
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime
 from datetime import timedelta as td
 from secrets import token_urlsafe
@@ -14,7 +15,7 @@ from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import User
 from django.core.signing import BadSignature, TimestampSigner
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q, QuerySet
 from django.db.models.functions import Lower
 from django.template.loader import render_to_string
@@ -51,6 +52,34 @@ REPORT_CHOICES = (
 OVER_LIMIT_GRACE = td(days=31)
 # When scheduling for deletion, how many days in the future to schedule
 DELETION_GRACE = td(days=31)
+
+
+class ApiKeyError(Exception):
+    """Base class for API key governance errors."""
+
+
+class RotationInProgressError(ApiKeyError):
+    """Raised when a rotation is started while a rotation window is open.
+
+    A slot can hold at most the current and the previous key, so starting
+    a second rotation before the window closes would create an unreconcilable
+    state with three live keys.
+    """
+
+
+class NoCurrentKeyError(ApiKeyError):
+    """Raised when an operation requires a current key but the slot is empty."""
+
+
+def governance_seconds(setting_name: str) -> int:
+    """Return a governance duration setting as a positive int.
+
+    hc.api.apps.api_key_governance_check guarantees (at startup, when
+    governance is enabled) that these settings are positive integers.
+    """
+    value = getattr(settings, setting_name)
+    assert isinstance(value, int) and value > 0
+    return value
 
 
 def month(dt: datetime) -> date:
@@ -596,6 +625,457 @@ class Project(models.Model):
         q = User.objects.filter(memberships__project=self).order_by("email")
         member_emails = list(q.values_list("email", flat=True))
         return [self.owner.email] + member_emails
+
+    # -- API key rotation and expiry governance (opt-in) ---------------
+
+    def _lock_self(self) -> None:
+        """Acquire a row lock on this project.
+
+        Serializes governance mutations (rotation/revocation) per project,
+        so they cannot interleave with each other.
+        """
+        list(Project.objects.select_for_update().filter(pk=self.pk))
+
+    def _new_credential(self, slot: str) -> tuple["ApiKeyCredential", str]:
+        """Generate and persist a new current credential for the slot."""
+        prefix = "hcw_" if slot == "api_key" else "hcr_"
+        key, key_hash = self._make_api_key(prefix)
+
+        expires_at: datetime | None = None
+        if settings.API_KEY_EXPIRATION_ENABLED:
+            expires_at = now() + td(
+                seconds=governance_seconds("API_KEY_LIFETIME")
+            )
+
+        cred = ApiKeyCredential(
+            project=self,
+            slot=slot,
+            key_hash=key_hash,
+            prefix=key_hash.split(".", 1)[0],
+            status=ApiKeyCredential.Status.CURRENT,
+            expires_at=expires_at,
+        )
+        cred.save()
+
+        # Keep the legacy column in sync with the current key
+        Project.objects.filter(pk=self.pk).update(**{slot: key_hash})
+        setattr(self, slot, key_hash)
+        return cred, key
+
+    def create_api_credential(self, slot: str) -> str:
+        """Generate the current key for an empty slot. Returns plaintext once."""
+        with transaction.atomic():
+            self._lock_self()
+            if ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.CURRENT
+            ).exists():
+                raise ApiKeyError("The slot already has a current API key")
+            return self._new_credential(slot)[1]
+
+    def start_key_rotation(self, slot: str) -> str:
+        """Rotate the slot's key, demoting the current key to "previous".
+
+        The previous key keeps authenticating until the rotation window ends.
+        Returns the new plaintext key (shown to the user exactly once).
+        """
+        with transaction.atomic():
+            self._lock_self()
+            if ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.PREVIOUS
+            ).exists():
+                raise RotationInProgressError(
+                    "A key rotation is already in progress for this slot. "
+                    "Wait for the transition window to end or revoke the "
+                    "previous key before rotating again."
+                )
+
+            current = ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.CURRENT
+            ).first()
+            if current is None:
+                raise NoCurrentKeyError("The slot has no current API key")
+
+            current.status = ApiKeyCredential.Status.PREVIOUS
+            current.window_expires_at = now() + td(
+                seconds=governance_seconds("API_KEY_ROTATION_WINDOW")
+            )
+            current.save(update_fields=["status", "window_expires_at"])
+
+            return self._new_credential(slot)[1]
+
+    def finish_key_rotation(self, slot: str) -> bool:
+        """Close the rotation window immediately, invalidating previous key."""
+        with transaction.atomic():
+            self._lock_self()
+            n = ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.PREVIOUS
+            ).update(
+                status=ApiKeyCredential.Status.INVALID,
+                invalid_reason=ApiKeyCredential.InvalidReason.WINDOW,
+                window_expires_at=now(),
+            )
+            return n > 0
+
+    def revoke_previous_key(self, slot: str) -> bool:
+        """Revoke the previous key while a rotation window is open."""
+        with transaction.atomic():
+            self._lock_self()
+            n = ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.PREVIOUS
+            ).update(
+                status=ApiKeyCredential.Status.INVALID,
+                invalid_reason=ApiKeyCredential.InvalidReason.WINDOW,
+                window_expires_at=now(),
+            )
+            return n > 0
+
+    def revoke_current_key(self, slot: str) -> None:
+        """Revoke the current key together with any previous key in window."""
+        with transaction.atomic():
+            self._lock_self()
+            ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.PREVIOUS
+            ).update(
+                status=ApiKeyCredential.Status.INVALID,
+                invalid_reason=ApiKeyCredential.InvalidReason.WINDOW,
+                window_expires_at=now(),
+            )
+            ApiKeyCredential.objects.filter(
+                project=self, slot=slot, status=ApiKeyCredential.Status.CURRENT
+            ).update(
+                status=ApiKeyCredential.Status.INVALID,
+                invalid_reason=ApiKeyCredential.InvalidReason.REVOKED,
+            )
+
+            Project.objects.filter(pk=self.pk).update(**{slot: ""})
+            setattr(self, slot, "")
+
+
+@dataclass
+class ApiAuthResult:
+    """Outcome of a governance-enabled API key authentication."""
+
+    accepted: bool
+    expired: bool = False
+    project: Project | None = None
+    readonly: bool = False
+    generation: str = "unknown"
+
+
+class ApiKeyCredentialManager(models.Manager["ApiKeyCredential"]):
+    def candidates_for(self, api_key: str) -> QuerySet["ApiKeyCredential"]:
+        """Return credentials that could match the presented API key.
+
+        Looks up hashed keys by the first 8 characters of their random part,
+        and legacy plain text keys by exact equality. The caller is responsible
+        for calling ApiKeyCredential.compare() and for checking slot access.
+        """
+        if api_key.startswith(("hcw_", "hcr_")) and len(api_key) == 32:
+            prefix = api_key[4:12]
+            return self.filter(Q(prefix=prefix) | Q(prefix="", key_hash=api_key))
+
+        # Legacy plain text keys (32 characters, no "hcw_"/"hcr_" prefix)
+        return self.filter(prefix="", key_hash=api_key)
+
+    def authenticate(
+        self, api_key: str, accept_rw: bool, accept_ro: bool, source: str
+    ) -> ApiAuthResult:
+        """Authenticate a presented API key against credentials.
+
+        Runs in a single transaction and locks the candidate credential rows,
+        so a concurrent rotation either commits before this call (old key is
+        then accepted as "previous" while the window is open) or after it
+        (old key accepted as "current"). There is no point in time where
+        neither the old nor the new key is recognized.
+
+        Always writes an ApiKeyAudit row for recognized-form keys and updates
+        the usage counters of accepted credentials.
+        """
+        C = ApiKeyCredential.Status.CURRENT
+        P = ApiKeyCredential.Status.PREVIOUS
+        I = ApiKeyCredential.Status.INVALID
+        RW = ApiKeyCredential.Slot.RW
+
+        allowed_slots: list[str] = []
+        if accept_rw:
+            allowed_slots.append(ApiKeyCredential.Slot.RW)
+        if accept_ro:
+            allowed_slots.append(ApiKeyCredential.Slot.RO)
+
+        inferred_slot: str
+        if api_key.startswith("hcr_"):
+            inferred_slot = ApiKeyCredential.Slot.RO
+        elif api_key.startswith("hcw_"):
+            inferred_slot = ApiKeyCredential.Slot.RW
+        else:
+            inferred_slot = ""
+        inferred_prefix = api_key[4:12] if inferred_slot else ""
+
+        with transaction.atomic():
+            candidates = list(
+                self.candidates_for(api_key)
+                .filter(slot__in=allowed_slots, status__in=(C, P, I))
+                .select_for_update()
+            )
+            matched = next((c for c in candidates if c.compare(api_key)), None)
+            ts = now()
+
+            if matched is None:
+                # Only audit attempts with a recognizable, attributable key
+                # form (hcw_/hcr_ prefix). Unrecognizable keys produce no
+                # audit rows -- they cannot be grouped by key prefix.
+                if inferred_slot:
+                    ApiKeyAudit.objects.create(
+                        project=None,
+                        slot=inferred_slot,
+                        key_prefix=inferred_prefix,
+                        generation=ApiKeyAudit.Generation.UNKNOWN,
+                        result=ApiKeyAudit.Result.REJECTED,
+                        source=source,
+                    )
+                return ApiAuthResult(accepted=False)
+
+            generation = (
+                ApiKeyAudit.Generation.CURRENT
+                if matched.status == C
+                else ApiKeyAudit.Generation.PREVIOUS
+            )
+            audit_prefix = matched.prefix or inferred_prefix
+
+            if matched.status == I:
+                # A previous key invalidated at window end, or a current key
+                # reaped after its grace, is reported as expired. A key revoked
+                # explicitly is a plain wrong key.
+                expired = matched.invalid_reason in (
+                    ApiKeyCredential.InvalidReason.WINDOW,
+                    ApiKeyCredential.InvalidReason.EXPIRED,
+                )
+                ApiKeyAudit.objects.create(
+                    project=matched.project,
+                    slot=matched.slot,
+                    key_prefix=audit_prefix,
+                    generation=generation,
+                    result=(
+                        ApiKeyAudit.Result.REJECTED_EXPIRED
+                        if expired
+                        else ApiKeyAudit.Result.REJECTED
+                    ),
+                    source=source,
+                )
+                return ApiAuthResult(accepted=False, expired=expired)
+
+            state = matched.evaluate(ts)
+            if state == "expired":
+                ApiKeyAudit.objects.create(
+                    project=matched.project,
+                    slot=matched.slot,
+                    key_prefix=audit_prefix,
+                    generation=generation,
+                    result=ApiKeyAudit.Result.REJECTED_EXPIRED,
+                    source=source,
+                )
+                return ApiAuthResult(accepted=False, expired=True)
+
+            accepted_result = (
+                ApiKeyAudit.Result.ACCEPTED_EXPIRED
+                if state == "grace"
+                else ApiKeyAudit.Result.ACCEPTED
+            )
+
+            matched.call_count += 1
+            matched.last_used_at = ts
+            matched.last_source = source
+            if matched.first_used_at is None:
+                matched.first_used_at = ts
+            matched.save(
+                update_fields=[
+                    "call_count",
+                    "last_used_at",
+                    "last_source",
+                    "first_used_at",
+                ]
+            )
+            ApiKeyAudit.objects.create(
+                project=matched.project,
+                slot=matched.slot,
+                key_prefix=audit_prefix,
+                generation=generation,
+                result=accepted_result,
+                source=source,
+            )
+
+            return ApiAuthResult(
+                accepted=True,
+                project=matched.project,
+                readonly=matched.slot != RW,
+                generation=generation,
+            )
+
+
+class ApiKeyCredential(models.Model):
+    """A single API key value held in one of the project's key slots.
+
+    Each (project, slot) pair has at most one current key and at most one
+    previous (in rotation window) key. key_hash uses the existing
+    "secret8.hmacdigest" storage format; rows migrated from plain text keys
+    hold the plain text value with an empty prefix.
+    """
+
+    class Slot(models.TextChoices):
+        RW = "api_key", "API key"
+        RO = "api_key_readonly", "API key (read-only)"
+
+    class Status(models.TextChoices):
+        CURRENT = "c", "Current"
+        PREVIOUS = "p", "Previous"
+        INVALID = "i", "Invalid"
+
+    class InvalidReason(models.TextChoices):
+        # Rotation window ended (or the previous key was revoked in-window)
+        WINDOW = "window", "Rotation window ended"
+        # Current key revoked by a user (revoke takes previous key too)
+        REVOKED = "revoked", "Revoked"
+        # Current key past its expiry + grace, reaped by the prune task
+        EXPIRED = "expired", "Expired"
+
+    project = models.ForeignKey(
+        Project, models.CASCADE, related_name="api_key_credentials"
+    )
+    slot = models.CharField(max_length=32, choices=Slot.choices)
+    key_hash = models.CharField(max_length=128)
+    prefix = models.CharField(max_length=8, blank=True, db_index=True)
+    status = models.CharField(
+        max_length=1, choices=Status.choices, default=Status.CURRENT, db_index=True
+    )
+    # Why an INVALID credential stopped authenticating (null while live)
+    invalid_reason = models.CharField(
+        max_length=16, choices=InvalidReason.choices, null=True, blank=True
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    # Set when the key is demoted to "previous": when the rotation window ends
+    window_expires_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    first_used_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    last_source = models.CharField(max_length=16, blank=True)
+    call_count = models.IntegerField(default=0)
+
+    objects = ApiKeyCredentialManager()
+
+    class Meta:
+        constraints = (
+            models.UniqueConstraint(
+                fields=["project", "slot"],
+                condition=Q(status="c"),
+                name="accounts_apikey_one_current",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "slot"],
+                condition=Q(status="p"),
+                name="accounts_apikey_one_previous",
+            ),
+        )
+
+    @property
+    def masked(self) -> str:
+        shown = "hcw_" if self.slot == ApiKeyCredential.Slot.RW else "hcr_"
+        if self.prefix:
+            return shown + self.prefix + "*" * 20
+        if self.key_hash:
+            # Legacy plain text keys are masked like in the existing UI
+            return self.key_hash[:4] + "*" * (len(self.key_hash) - 4)
+        return ""
+
+    def compare(self, key: str) -> bool:
+        """Check if the presented plain text key matches this credential."""
+        if "." in self.key_hash:
+            _, digest = self.key_hash.split(".", maxsplit=1)
+            computed = hmac.digest(
+                settings.SECRET_KEY.encode(), key.encode(), "sha256"
+            )
+            return hmac.compare_digest(computed.hex(), digest)
+
+        # Legacy plain text credential
+        return hmac.compare_digest(self.key_hash, key)
+
+    def is_expired(self, ts: datetime) -> bool:
+        return self.expires_at is not None and ts > self.expires_at
+
+    def in_grace(self, ts: datetime) -> bool:
+        """Return True if the key is expired but still inside the grace period."""
+        if not settings.API_KEY_EXPIRATION_ENABLED or not self.is_expired(ts):
+            return False
+        grace = td(seconds=governance_seconds("API_KEY_EXPIRATION_GRACE"))
+        assert self.expires_at is not None
+        return ts <= self.expires_at + grace
+
+    def window_is_open(self, ts: datetime) -> bool:
+        if self.status != ApiKeyCredential.Status.PREVIOUS:
+            return False
+        return self.window_expires_at is not None and ts < self.window_expires_at
+
+    def evaluate(self, ts: datetime) -> str:
+        """Return the credential's effective state at time ts.
+
+        One of:
+        * "valid"          - accepted normally
+        * "grace"          - expired but accepted during the grace period
+        * "expired"        - rejected: window closed or past grace
+        """
+        if self.status == ApiKeyCredential.Status.PREVIOUS and not self.window_is_open(
+            ts
+        ):
+            return "expired"
+
+        if settings.API_KEY_EXPIRATION_ENABLED and self.expires_at is not None:
+            grace_end = self.expires_at + td(
+                seconds=governance_seconds("API_KEY_EXPIRATION_GRACE")
+            )
+            if ts >= grace_end:
+                return "expired"
+            if ts > self.expires_at:
+                return "grace"
+
+        return "valid"
+
+
+class ApiKeyAudit(models.Model):
+    """An API key authentication event.
+
+    Stores only the slot, key prefix (the 8 masked characters), generation,
+    result, source category and timestamp. Never stores key material.
+    """
+
+    class Generation(models.TextChoices):
+        CURRENT = "current", "Current"
+        PREVIOUS = "previous", "Previous"
+        UNKNOWN = "unknown", "Unknown"
+
+    class Result(models.TextChoices):
+        ACCEPTED = "accepted", "Accepted"
+        ACCEPTED_EXPIRED = "accepted_expired", "Accepted (expired, in grace)"
+        REJECTED = "rejected", "Rejected"
+        REJECTED_EXPIRED = "rejected_expired", "Rejected (expired)"
+
+    class Source(models.TextChoices):
+        HEADER = "header", "X-Api-Key header"
+        BODY = "body", "request body"
+
+    # Null for rejected attempts whose presented key matches no project, so
+    # unauthorized probes are still recorded and grouped by key prefix.
+    project = models.ForeignKey(
+        Project, models.CASCADE, related_name="api_key_audits", null=True, blank=True
+    )
+    slot = models.CharField(max_length=32, blank=True)
+    key_prefix = models.CharField(max_length=8, blank=True)
+    generation = models.CharField(
+        max_length=8, choices=Generation.choices, default=Generation.UNKNOWN
+    )
+    result = models.CharField(max_length=16, choices=Result.choices)
+    source = models.CharField(max_length=16, choices=Source.choices)
+    created_at = models.DateTimeField(default=now, db_index=True)
 
 
 class Member(models.Model):

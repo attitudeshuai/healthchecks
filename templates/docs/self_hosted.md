@@ -197,6 +197,16 @@ exist in the database.
 $ ./manage.py pruneobjects
 ```
 
+When API key rotation is enabled (`API_KEY_ROTATION_ENABLED=True`), run
+`pruneapikeys` regularly (every `API_KEY_PRUNE_SCAN_PERIOD` seconds). It marks
+previous keys invalid once their rotation window has ended, invalidates
+current keys past their expiry grace, and deletes API key audit records
+older than `API_KEY_AUDIT_RETENTION`.
+
+```sh
+$ ./manage.py pruneapikeys
+```
+
 When you first try these commands on your data, it is a good idea to
 test them on a copy of your database, not on the live database right away.
 In a production setup, you will want to run these commands regularly, as well as

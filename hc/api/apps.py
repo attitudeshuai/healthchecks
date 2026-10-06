@@ -82,6 +82,61 @@ def settings_check(
     return items
 
 
+@register()  # E004, E005, E006
+def api_key_governance_check(
+    app_configs: Sequence[AppConfig] | None,
+    databases: Sequence[str] | None,
+    **kwargs: dict[str, Any],
+) -> list[Error]:
+    items: list[Error] = []
+
+    if settings.API_KEY_EXPIRATION_ENABLED and not settings.API_KEY_ROTATION_ENABLED:
+        items.append(
+            Error(
+                "API_KEY_EXPIRATION_ENABLED is set but API_KEY_ROTATION_ENABLED is not",
+                hint="API key expiry requires the API key governance feature to be "
+                "enabled. Set API_KEY_ROTATION_ENABLED=True or disable expiry.",
+                id="hc.api.E004",
+            )
+        )
+
+    if not settings.API_KEY_ROTATION_ENABLED:
+        return items
+
+    durations = {
+        "API_KEY_ROTATION_WINDOW": settings.API_KEY_ROTATION_WINDOW,
+        "API_KEY_AUDIT_RETENTION": settings.API_KEY_AUDIT_RETENTION,
+        "API_KEY_PRUNE_SCAN_PERIOD": settings.API_KEY_PRUNE_SCAN_PERIOD,
+    }
+    if settings.API_KEY_EXPIRATION_ENABLED:
+        durations["API_KEY_LIFETIME"] = settings.API_KEY_LIFETIME
+        durations["API_KEY_EXPIRATION_GRACE"] = settings.API_KEY_EXPIRATION_GRACE
+
+    for name, value in durations.items():
+        if value is None or value <= 0:
+            items.append(
+                Error(
+                    f"{name} must be a positive number of seconds, got {value!r}",
+                    hint=f"Set {name} to a positive integer.",
+                    id="hc.api.E005",
+                )
+            )
+
+    scan_period = settings.API_KEY_PRUNE_SCAN_PERIOD
+    window = settings.API_KEY_ROTATION_WINDOW
+    if scan_period is not None and window is not None and scan_period < window:
+        items.append(
+            Error(
+                "API_KEY_PRUNE_SCAN_PERIOD is shorter than API_KEY_ROTATION_WINDOW",
+                hint=f"The prune task scan period ({scan_period}s) must not be less "
+                f"than the rotation window ({window}s).",
+                id="hc.api.E006",
+            )
+        )
+
+    return items
+
+
 @register()  # E001
 def mariadb_uuid_check(
     app_configs: Sequence[AppConfig] | None,

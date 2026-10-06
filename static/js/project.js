@@ -45,6 +45,27 @@ $(function () {
         return false;
     });
 
+    $("a[data-rotate-key]").click(function () {
+        $("#rotate-key-type").val(this.dataset.rotateKey);
+        $("#rotate-key-modal .name").text(this.dataset.name);
+        $("#rotate-key-modal").modal("show");
+        return false;
+    });
+
+    $("a[data-finish-key]").click(function () {
+        $("#finish-key-type").val(this.dataset.finishKey);
+        $("#finish-key-modal .name").text(this.dataset.name);
+        $("#finish-key-modal").modal("show");
+        return false;
+    });
+
+    $("a[data-revoke-old-key]").click(function () {
+        $("#revoke-old-key-type").val(this.dataset.revokeOldKey);
+        $("#revoke-old-key-modal .name").text(this.dataset.name);
+        $("#revoke-old-key-modal").modal("show");
+        return false;
+    });
+
     $("code[data-plaintext]").tooltip({"title": "Click to reveal"});
     $("code[data-plaintext]").click(function () {
         $(this).text(this.dataset.plaintext).tooltip("destroy");

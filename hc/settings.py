@@ -271,9 +271,25 @@ PING_ENDPOINT = os.getenv("PING_ENDPOINT", SITE_ROOT + "/ping/")
 PING_EMAIL_DOMAIN = os.getenv("PING_EMAIL_DOMAIN", "localhost")
 PING_BODY_LIMIT = envint("PING_BODY_LIMIT", "10000")
 # If PING_BODY_LIMIT is higher than the default value for DATA_UPLOAD_MAX_MEMORY_SIZE,
-# then we need to bump up DATA_UPLOAD_MAX_MEMORY_SIZE too:
+# then we need to bump DATA_UPLOAD_MAX_MEMORY_SIZE too:
 if PING_BODY_LIMIT and PING_BODY_LIMIT > 2621440:
     DATA_UPLOAD_MAX_MEMORY_SIZE = PING_BODY_LIMIT
+
+# API key rotation and expiry governance.
+# Disabled by default: when disabled, API key authentication works exactly
+# as before (single value per slot, overwrite-on-regenerate).
+API_KEY_ROTATION_ENABLED = envbool("API_KEY_ROTATION_ENABLED", "False")
+# How long the previous key remains valid after a rotation (seconds)
+API_KEY_ROTATION_WINDOW = envint("API_KEY_ROTATION_WINDOW", "86400")
+API_KEY_EXPIRATION_ENABLED = envbool("API_KEY_EXPIRATION_ENABLED", "False")
+# Lifetime of a newly generated key when expiry is enabled (seconds)
+API_KEY_LIFETIME = envint("API_KEY_LIFETIME", "7776000")
+# For how long an expired key keeps being accepted (flagged in audit) (seconds)
+API_KEY_EXPIRATION_GRACE = envint("API_KEY_EXPIRATION_GRACE", "604800")
+# How long API key audit records are retained (seconds)
+API_KEY_AUDIT_RETENTION = envint("API_KEY_AUDIT_RETENTION", "2592000")
+# How often the pruneapikeys task is scheduled to run (seconds)
+API_KEY_PRUNE_SCAN_PERIOD = envint("API_KEY_PRUNE_SCAN_PERIOD", "86400")
 _site_root_parts = urlparse(SITE_ROOT)
 LOGIN_URL = f"{_site_root_parts.path}/accounts/login/"
 STATIC_URL = f"{_site_root_parts.path}/static/"

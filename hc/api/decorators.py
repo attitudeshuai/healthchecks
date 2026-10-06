@@ -5,9 +5,10 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
+from django.conf import settings
 from django.http import HttpRequest, HttpResponse, JsonResponse
 
-from hc.accounts.models import Project
+from hc.accounts.models import ApiKeyAudit, ApiKeyCredential, Project
 from hc.lib.typealias import ViewFunc
 
 
@@ -16,6 +17,9 @@ class ApiRequest(HttpRequest):
     project: Project
     readonly: bool
     v: int
+    # "current" or "previous": which key generation authenticated this request.
+    # Empty when API key governance is disabled.
+    api_key_generation: str
 
 
 def error(msg: str, status: int = 400) -> JsonResponse:
@@ -46,7 +50,8 @@ def authorize(f: ViewFunc) -> ViewFunc:
         else:
             request.json = {}
 
-        if "X-Api-Key" in request.headers:
+        from_header = "X-Api-Key" in request.headers
+        if from_header:
             api_key = request.headers["X-Api-Key"]
         elif "api_key" in request.json:
             api_key = str(request.json["api_key"])
@@ -56,12 +61,32 @@ def authorize(f: ViewFunc) -> ViewFunc:
         if len(api_key) != 32:
             return error("missing api key", 401)
 
-        project = Project.objects.for_api_key(api_key, accept_rw=True, accept_ro=False)
-        if project is None:
-            return error("wrong api key", 401)
+        if settings.API_KEY_ROTATION_ENABLED:
+            source = (
+                ApiKeyAudit.Source.HEADER if from_header else ApiKeyAudit.Source.BODY
+            )
+            outcome = ApiKeyCredential.objects.authenticate(
+                api_key, accept_rw=True, accept_ro=False, source=source
+            )
+            if not outcome.accepted or outcome.project is None:
+                if outcome.expired:
+                    return error("api key is expired", 401)
+                return error("wrong api key", 401)
 
-        request.project = project
-        request.readonly = False
+            request.project = outcome.project
+            request.readonly = False
+            request.api_key_generation = outcome.generation
+        else:
+            project = Project.objects.for_api_key(
+                api_key, accept_rw=True, accept_ro=False
+            )
+            if project is None:
+                return error("wrong api key", 401)
+
+            request.project = project
+            request.readonly = False
+            request.api_key_generation = ""
+
         request.v = _get_api_version(request)
         return f(request, *args, **kwds)
 
@@ -79,14 +104,35 @@ def authorize_read(f: ViewFunc) -> ViewFunc:
         if len(api_key) != 32:
             return error("missing api key", 401)
 
-        project = Project.objects.for_api_key(api_key, accept_rw=True, accept_ro=True)
-        if project is None:
-            return error("wrong api key", 401)
+        if settings.API_KEY_ROTATION_ENABLED:
+            outcome = ApiKeyCredential.objects.authenticate(
+                api_key,
+                accept_rw=True,
+                accept_ro=True,
+                source=ApiKeyAudit.Source.HEADER,
+            )
+            if not outcome.accepted or outcome.project is None:
+                if outcome.expired:
+                    return error("api key is expired", 401)
+                return error("wrong api key", 401)
 
-        request.project = project
-        request.readonly = (
-            api_key.startswith("hcr_") or api_key == request.project.api_key_readonly
-        )
+            request.project = outcome.project
+            request.readonly = outcome.readonly
+            request.api_key_generation = outcome.generation
+        else:
+            project = Project.objects.for_api_key(
+                api_key, accept_rw=True, accept_ro=True
+            )
+            if project is None:
+                return error("wrong api key", 401)
+
+            request.project = project
+            request.readonly = (
+                api_key.startswith("hcr_")
+                or api_key == request.project.api_key_readonly
+            )
+            request.api_key_generation = ""
+
         request.v = _get_api_version(request)
         return f(request, *args, **kwds)
 
