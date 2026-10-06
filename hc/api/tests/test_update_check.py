@@ -341,6 +341,33 @@ class UpdateCheckTestCase(BaseTestCase):
         self.check.refresh_from_db()
         self.assertFalse(self.check.manual_resume)
 
+    def test_it_hides_check_from_badges(self) -> None:
+        r = self.post(self.check.code, {"public": False})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["public"])
+
+        self.check.refresh_from_db()
+        self.assertFalse(self.check.public)
+
+    def test_it_shows_check_in_badges(self) -> None:
+        self.check.public = False
+        self.check.save()
+
+        r = self.post(self.check.code, {"public": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["public"])
+
+        self.check.refresh_from_db()
+        self.assertTrue(self.check.public)
+
+    def test_it_rejects_non_boolean_public(self) -> None:
+        self.post(
+            self.check.code, {"public": "yes"}, expect_fragment="public is not a boolean"
+        )
+
+        self.check.refresh_from_db()
+        self.assertTrue(self.check.public)
+
     def test_it_sets_methods(self) -> None:
         r = self.post(self.check.code, {"methods": "POST"})
         self.assertEqual(r.status_code, 200)

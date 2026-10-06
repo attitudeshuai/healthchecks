@@ -470,6 +470,13 @@ manual_resume
     a ping. If set to true, a paused check will ignore pings and stay paused until
     you manually resume it from the web dashboard.
 
+public
+:   Boolean, optional, default value: true.
+
+    Controls whether the check appears in public status badges. If set to false,
+    the check is excluded from aggregate (project and tag) badges, and its
+    single-check badge URL returns "404 Not Found".
+
 methods
 :   String, optional, default value: "".
 
@@ -802,6 +809,13 @@ manual_resume
     or not. If set to false, a paused check will leave the paused state when it receives
     a ping. If set to true, a paused check will ignore pings and stay paused until
     you manually resume it from the web dashboard.
+
+public
+:   Boolean, optional, default value: true.
+
+    Controls whether the check appears in public status badges. If set to false,
+    the check is excluded from aggregate (project and tag) badges, and its
+    single-check badge URL returns "404 Not Found".
 
 methods
 :   String, optional, default value: "".

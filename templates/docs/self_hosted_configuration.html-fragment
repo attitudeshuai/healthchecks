@@ -5,6 +5,7 @@ from environment variables. Below is a list of environment variables it reads an
 <li><a href="#ADMINS">ADMINS</a></li>
 <li><a href="#ALLOWED_HOSTS">ALLOWED_HOSTS</a></li>
 <li><a href="#APPRISE_ENABLED">APPRISE_ENABLED</a></li>
+<li><a href="#BADGE_CACHE_TIMEOUT">BADGE_CACHE_TIMEOUT</a></li>
 <li><a href="#DB">DB</a></li>
 <li><a href="#DB_CONN_MAX_AGE">DB_CONN_MAX_AGE</a></li>
 <li><a href="#DB_HOST">DB_HOST</a></li>
@@ -342,6 +343,26 @@ IP address, you will need to enable <code>INTEGRATIONS_ALLOW_PRIVATE_IPS</code> 
 <p>This setting <em>does not</em> have effect on the Apprise integration, as the Apprise library
 uses its own HTTP client. Apprise can make requests to private IPs regardless
 of this setting.</p>
+<h2 id="BADGE_CACHE_TIMEOUT"><code>BADGE_CACHE_TIMEOUT</code></h2>
+<p>Default: <code>None</code></p>
+<p>Controls caching and conditional requests (<code>ETag</code>/<code>If-None-Match</code> and
+<code>If-Modified-Since</code>) for the public status badge responses. The value is the
+cache lifetime in seconds.</p>
+<p>When set to <code>None</code> (the default), badge responses are not cached and carry
+<code>Cache-Control: no-cache</code> headers, preserving the historical behavior.</p>
+<p>Set it to a positive number of seconds to let monitoring dashboards and
+external badge services poll badge URLs without triggering a database query and
+a re-render on every request:</p>
+<ul>
+<li>The first response carries <code>ETag</code>, <code>Last-Modified</code> and
+  <code>Cache-Control: max-age=&lt;seconds&gt;</code> headers.</li>
+<li>Requests carrying a matching <code>If-None-Match</code> validator, or an unexpired
+  <code>If-Modified-Since</code> condition, receive a <code>304 Not Modified</code> response with
+  no body.</li>
+<li>The validator covers the involved checks, their current statuses and the
+  aggregation options, so any change to them causes a full response on the
+  next conditional request.</li>
+</ul>
 <h2 id="MASTER_BADGE_URL"><code>MASTER_BADGE_LABEL</code></h2>
 <p>Default: same as <code>SITE_NAME</code></p>
 <p>The label for the "Overall Status" status badge.</p>

@@ -7,6 +7,7 @@ from environment variables. Below is a list of environment variables it reads an
 <li><a href="#ADMINS">ADMINS</a></li>
 <li><a href="#ALLOWED_HOSTS">ALLOWED_HOSTS</a></li>
 <li><a href="#APPRISE_ENABLED">APPRISE_ENABLED</a></li>
+<li><a href="#BADGE_CACHE_TIMEOUT">BADGE_CACHE_TIMEOUT</a></li>
 <li><a href="#DB">DB</a></li>
 <li><a href="#DB_CONN_MAX_AGE">DB_CONN_MAX_AGE</a></li>
 <li><a href="#DB_HOST">DB_HOST</a></li>
@@ -466,6 +467,30 @@ IP address, you will need to enable `INTEGRATIONS_ALLOW_PRIVATE_IPS` to use it.
 This setting *does not* have effect on the Apprise integration, as the Apprise library
 uses its own HTTP client. Apprise can make requests to private IPs regardless
 of this setting.
+
+## `BADGE_CACHE_TIMEOUT` {: #BADGE_CACHE_TIMEOUT }
+
+Default: `None`
+
+Controls caching and conditional requests (`ETag`/`If-None-Match` and
+`If-Modified-Since`) for the public status badge responses. The value is the
+cache lifetime in seconds.
+
+When set to `None` (the default), badge responses are not cached and carry
+`Cache-Control: no-cache` headers, preserving the historical behavior.
+
+Set it to a positive number of seconds to let monitoring dashboards and
+external badge services poll badge URLs without triggering a database query and
+a re-render on every request:
+
+* The first response carries `ETag`, `Last-Modified` and
+  `Cache-Control: max-age=<seconds>` headers.
+* Requests carrying a matching `If-None-Match` validator, or an unexpired
+  `If-Modified-Since` condition, receive a `304 Not Modified` response with
+  no body.
+* The validator covers the involved checks, their current statuses and the
+  aggregation options, so any change to them causes a full response on the
+  next conditional request.
 
 ## `MASTER_BADGE_LABEL` {: #MASTER_BADGE_URL }
 

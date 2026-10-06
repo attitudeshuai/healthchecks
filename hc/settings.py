@@ -267,6 +267,10 @@ SITE_ROOT = os.getenv("SITE_ROOT", "http://localhost:8000").removesuffix("/")
 SITE_NAME = os.getenv("SITE_NAME", "Mychecks")
 SITE_LOGO_URL = os.getenv("SITE_LOGO_URL")
 MASTER_BADGE_LABEL = os.getenv("MASTER_BADGE_LABEL", SITE_NAME)
+# How long clients and intermediaries may cache badge responses, in seconds.
+# Also enables ETag/If-None-Match and If-Modified-Since conditional requests.
+# None (the default) disables badge caching and keeps the old no-cache behavior.
+BADGE_CACHE_TIMEOUT = envint("BADGE_CACHE_TIMEOUT", "None")
 PING_ENDPOINT = os.getenv("PING_ENDPOINT", SITE_ROOT + "/ping/")
 PING_EMAIL_DOMAIN = os.getenv("PING_EMAIL_DOMAIN", "localhost")
 PING_BODY_LIMIT = envint("PING_BODY_LIMIT", "10000")

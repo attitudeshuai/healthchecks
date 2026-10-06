@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import email.policy
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from datetime import timedelta as td
 from email import message_from_bytes
+from functools import wraps
 from ipaddress import ip_address
 from typing import Any, Literal
 from uuid import UUID
@@ -23,9 +24,11 @@ from django.http import (
     HttpResponseBadRequest,
     HttpResponseForbidden,
     HttpResponseNotFound,
+    HttpResponseNotModified,
     JsonResponse,
 )
 from django.shortcuts import get_object_or_404
+from django.utils.cache import add_never_cache_headers
 from django.utils.text import slugify
 from django.utils.timezone import now
 from django.views.decorators.cache import never_cache
@@ -39,7 +42,15 @@ from hc.accounts.models import Profile, Project
 from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
 from hc.api.forms import FlipsFiltersForm
 from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
-from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
+from hc.lib.badges import (
+    apply_badge_cache_headers,
+    check_signature,
+    etag_matches,
+    fresh_if_modified_since,
+    get_badge_svg,
+    get_badge_url,
+    make_etag,
+)
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
 from hc.lib.tz import all_timezones, legacy_timezones
@@ -70,6 +81,7 @@ class Spec(BaseModel):
     manual_resume: bool | None = None
     methods: Literal["", "POST"] | None = None
     name: str | None = Field(None, max_length=100)
+    public: bool | None = None
     schedule: str | None = Field(None, max_length=100)
     slug: str | None = Field(None, max_length=100, pattern="^[a-z0-9-_]*$")
     start_kw: str | None = Field(None, max_length=200)
@@ -389,6 +401,7 @@ def _update(check: Check, spec: Spec, v: int) -> None:
         "filter_http_body",
         "filter_default_fail",
         "grace",
+        "public",
     ):
         v = getattr(spec, key)
         if v is not None:
@@ -712,6 +725,22 @@ def badges(request: ApiRequest) -> JsonResponse:
 
 SHIELDS_COLORS = {"up": "success", "late": "important", "down": "critical"}
 
+# Fields needed to calculate a check's current status and its badge membership.
+# Loading only these keeps conditional badge requests light.
+BADGE_CHECK_FIELDS = (
+    "id",
+    "kind",
+    "status",
+    "tags",
+    "public",
+    "last_ping",
+    "last_start",
+    "timeout",
+    "grace",
+    "schedule",
+    "tz",
+)
+
 
 def _shields_response(label: str, status: str) -> JsonResponse:
     return JsonResponse(
@@ -724,48 +753,49 @@ def _shields_response(label: str, status: str) -> JsonResponse:
     )
 
 
-@never_cache
-@cors("GET")
-def badge(
-    request: HttpRequest, badge_key: str, signature: str, tag: str, fmt: str
+def badge_cache_control(f: Callable[..., HttpResponse]) -> Callable[..., HttpResponse]:
+    """Replicate the historical never-cache headers when caching is disabled.
+
+    When BADGE_CACHE_TIMEOUT is set, the badge views attach their own
+    Cache-Control / ETag / Last-Modified headers, and this decorator leaves
+    the response untouched.
+    """
+
+    @wraps(f)
+    def wrapper(request: HttpRequest, *args: Any, **kwds: Any) -> HttpResponse:
+        response = f(request, *args, **kwds)
+        if settings.BADGE_CACHE_TIMEOUT is None:
+            add_never_cache_headers(response)
+        return response
+
+    return wrapper
+
+
+def _badge_not_found(timeout: int | None) -> HttpResponse:
+    response = HttpResponseNotFound()
+    if timeout is not None:
+        # The decorator only adds never-cache headers when caching is off,
+        # error responses must never be cached when caching is on.
+        add_never_cache_headers(response)
+    return response
+
+
+def _not_modified(
+    timeout: int,
+    *,
+    etag: str | None = None,
+    last_modified: float | None = None,
+) -> HttpResponseNotModified:
+    response = HttpResponseNotModified()
+    apply_badge_cache_headers(
+        response, timeout, etag=etag, last_modified=last_modified
+    )
+    return response
+
+
+def _build_badge_response(
+    fmt: str, label: str, status: str, total: int, grace: int, down: int
 ) -> HttpResponse:
-    if fmt not in ("svg", "json", "shields"):
-        return HttpResponseNotFound()
-
-    with_late = True
-    if len(signature) == 10 and signature.endswith("-2"):
-        with_late = False
-
-    if not check_signature(badge_key, tag, signature):
-        return HttpResponseNotFound()
-
-    q = Check.objects.filter(project__badge_key=badge_key)
-    if tag == "*":
-        label = settings.MASTER_BADGE_LABEL
-    else:
-        q = q.filter(tags__contains=tag)
-        label = tag
-
-    status, total, grace, down = "up", 0, 0, 0
-    for check in q:
-        if tag != "*" and tag not in check.tags_list():
-            continue
-
-        total += 1
-        check_status = check.get_status()
-
-        if check_status == "down":
-            down += 1
-            status = "down"
-            if fmt == "svg":
-                # For SVG badges, we can leave the loop as soon as we
-                # find the first "down"
-                break
-        elif check_status == "grace":
-            grace += 1
-            if status == "up" and with_late:
-                status = "late"
-
     if fmt == "shields":
         return _shields_response(label, status)
 
@@ -778,16 +808,122 @@ def badge(
     return HttpResponse(svg, content_type="image/svg+xml")
 
 
-@never_cache
-@cors("GET")
-def check_badge(
-    request: HttpRequest, states: int, badge_key: UUID, fmt: str
-) -> HttpResponse:
-    if fmt not in ("svg", "json", "shields"):
-        return HttpResponseNotFound()
+def _evaluate_aggregate(
+    badge_key: str, tag: str, fmt: str, with_late: bool
+) -> tuple[str, str, int, int, int, str]:
+    """Calculate aggregate badge values and the matching ETag.
 
-    check = get_object_or_404(Check, badge_key=badge_key)
-    check_status = check.get_status()
+    Returns (label, status, total, grace, down, etag).
+    """
+    q = Check.objects.filter(project__badge_key=badge_key, public=True).only(
+        *BADGE_CHECK_FIELDS
+    )
+    if tag != "*":
+        q = q.filter(tags__contains=tag)
+
+    entries: list[tuple[int, str]] = []
+    status, total, grace, down = "up", 0, 0, 0
+    for check in q:
+        if tag != "*" and tag not in check.tags_list():
+            continue
+
+        check_status = check.get_status()
+        entries.append((check.id, check_status))
+
+        total += 1
+        if check_status == "down":
+            down += 1
+            status = "down"
+        elif check_status == "grace":
+            grace += 1
+            if status == "up" and with_late:
+                status = "late"
+
+    label = settings.MASTER_BADGE_LABEL if tag == "*" else tag
+    entries.sort()
+    etag = make_etag(str(badge_key), tag, fmt, with_late, label, entries)
+    return label, status, total, grace, down, etag
+
+
+@badge_cache_control
+@cors("GET")
+def badge(
+    request: HttpRequest, badge_key: str, signature: str, tag: str, fmt: str
+) -> HttpResponse:
+    timeout = settings.BADGE_CACHE_TIMEOUT
+
+    if fmt not in ("svg", "json", "shields"):
+        return _badge_not_found(timeout)
+
+    with_late = True
+    if len(signature) == 10 and signature.endswith("-2"):
+        with_late = False
+
+    if not check_signature(badge_key, tag, signature):
+        return _badge_not_found(timeout)
+
+    if timeout is None:
+        # Caching disabled: evaluate and render on every request, the outer
+        # decorator attaches the usual no-cache headers.
+        q = Check.objects.filter(project__badge_key=badge_key, public=True)
+        if tag == "*":
+            label = settings.MASTER_BADGE_LABEL
+        else:
+            q = q.filter(tags__contains=tag)
+            label = tag
+
+        status, total, grace, down = "up", 0, 0, 0
+        for check in q:
+            if tag != "*" and tag not in check.tags_list():
+                continue
+
+            total += 1
+            check_status = check.get_status()
+
+            if check_status == "down":
+                down += 1
+                status = "down"
+                if fmt == "svg":
+                    # For SVG badges, we can leave the loop as soon as we
+                    # find the first "down"
+                    break
+            elif check_status == "grace":
+                grace += 1
+                if status == "up" and with_late:
+                    status = "late"
+
+        return _build_badge_response(fmt, label, status, total, grace, down)
+
+    headers = request.headers
+    inm_header = headers.get("If-None-Match")
+
+    # If-None-Match takes precedence over If-Modified-Since (RFC 7232).
+    # A still-fresh If-Modified-Since lets us answer without querying the DB;
+    # check statuses are time-derived, so stale values cannot be trusted.
+    if inm_header is None:
+        ims_timestamp = fresh_if_modified_since(
+            headers.get("If-Modified-Since"), timeout
+        )
+        if ims_timestamp is not None:
+            return _not_modified(timeout, last_modified=float(ims_timestamp))
+
+    label, status, total, grace, down, etag = _evaluate_aggregate(
+        badge_key, tag, fmt, with_late
+    )
+
+    if inm_header is not None and etag_matches(inm_header, etag):
+        return _not_modified(timeout, etag=etag)
+
+    response = _build_badge_response(fmt, label, status, total, grace, down)
+    apply_badge_cache_headers(
+        response, timeout, etag=etag, last_modified=time.time()
+    )
+    return response
+
+
+def _build_check_badge_response(
+    check: Check, states: int, fmt: str, check_status: str
+) -> HttpResponse:
     status = "up"
     if check_status == "down":
         status = "down"
@@ -809,6 +945,52 @@ def check_badge(
 
     svg = get_badge_svg(check.name_then_code(), status)
     return HttpResponse(svg, content_type="image/svg+xml")
+
+
+@badge_cache_control
+@cors("GET")
+def check_badge(
+    request: HttpRequest, states: int, badge_key: UUID, fmt: str
+) -> HttpResponse:
+    timeout = settings.BADGE_CACHE_TIMEOUT
+
+    if fmt not in ("svg", "json", "shields"):
+        return _badge_not_found(timeout)
+
+    check = get_object_or_404(Check, badge_key=badge_key)
+    if not check.public:
+        # The check opted out of public badges, answer the same way as when
+        # the badge key does not exist.
+        raise Http404()
+
+    check_status = check.get_status()
+
+    if timeout is None:
+        # Outer decorator attaches the usual no-cache headers.
+        return _build_check_badge_response(check, states, fmt, check_status)
+
+    headers = request.headers
+    inm_header = headers.get("If-None-Match")
+
+    if inm_header is None:
+        ims_timestamp = fresh_if_modified_since(
+            headers.get("If-Modified-Since"), timeout
+        )
+        if ims_timestamp is not None:
+            return _not_modified(timeout, last_modified=float(ims_timestamp))
+
+    etag = make_etag(
+        str(badge_key), states, fmt, check.name_then_code(), check_status
+    )
+
+    if inm_header is not None and etag_matches(inm_header, etag):
+        return _not_modified(timeout, etag=etag)
+
+    response = _build_check_badge_response(check, states, fmt, check_status)
+    apply_badge_cache_headers(
+        response, timeout, etag=etag, last_modified=time.time()
+    )
+    return response
 
 
 @csrf_exempt

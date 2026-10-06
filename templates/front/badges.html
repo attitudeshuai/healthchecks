@@ -102,6 +102,34 @@
     </div>
     <div id="preview" class="col-md-8">{% include "front/badges_preview.html" %}</div>
 </div>
+
+{% if checks %}
+<div class="row">
+    <div class="col-sm-12">
+        <h2>Badge Visibility</h2>
+        <p>
+            Select checks which are allowed to appear in public status badges.
+            Unselected checks are excluded from aggregate badges, and their
+            single-check badge URLs return "not found".
+        </p>
+        <form id="badge-visibility-form" method="post"
+              action="{% url 'hc-badge-visibility' project.code %}">
+            {% csrf_token %}
+            <div class="form-group">
+                {% for check in checks %}
+                <label class="checkbox-container">
+                    <input type="checkbox" name="visible" value="{{ check.code }}"
+                           autocomplete="off" {% if check.public %}checked{% endif %}>
+                    <span class="checkmark"></span>
+                    {{ check.name_then_code }}
+                </label>
+                {% endfor %}
+            </div>
+            <button type="submit" class="btn btn-default">Save Visibility</button>
+        </form>
+    </div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}

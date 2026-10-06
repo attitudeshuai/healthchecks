@@ -137,6 +137,7 @@ class CheckDict(TypedDict):
     filter_body: bool
     filter_http_body: bool
     filter_default_fail: bool
+    public: bool
     badge_url: str
     last_duration: NotRequired[int]
     unique_key: NotRequired[str]
@@ -212,6 +213,9 @@ class Check(models.Model):
     methods = models.CharField(max_length=30, blank=True)
     manual_resume = models.BooleanField(default=False)
     badge_key = models.UUIDField(default=uuid.uuid4, unique=True)
+    # When set to False, the check is excluded from aggregate badges, and its
+    # single-check badge URL responds with 404.
+    public = models.BooleanField(default=True)
 
     n_pings = models.IntegerField(default=0)
     last_ping = models.DateTimeField(null=True, blank=True)
@@ -460,6 +464,7 @@ class Check(models.Model):
             "filter_body": self.filter_body,
             "filter_http_body": self.filter_http_body,
             "filter_default_fail": self.filter_default_fail,
+            "public": self.public,
             # Optimization: construct badge URLs manually instead of using reverse().
             # This is significantly quicker when returning hundreds of checks.
             "badge_url": f"{settings.SITE_ROOT}/b/2/{self.badge_key}.svg",

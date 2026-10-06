@@ -474,6 +474,13 @@ or not. If set to false, a paused check will leave the paused state when it rece
 a ping. If set to true, a paused check will ignore pings and stay paused until
 you manually resume it from the web dashboard.</p>
 </dd>
+<dt>public</dt>
+<dd>
+<p>Boolean, optional, default value: true.</p>
+<p>Controls whether the check appears in public status badges. If set to false,
+the check is excluded from aggregate (project and tag) badges, and its
+single-check badge URL returns "404 Not Found".</p>
+</dd>
 <dt>methods</dt>
 <dd>
 <p>String, optional, default value: "".</p>
@@ -742,6 +749,13 @@ month"):</p>
 or not. If set to false, a paused check will leave the paused state when it receives
 a ping. If set to true, a paused check will ignore pings and stay paused until
 you manually resume it from the web dashboard.</p>
+</dd>
+<dt>public</dt>
+<dd>
+<p>Boolean, optional, default value: true.</p>
+<p>Controls whether the check appears in public status badges. If set to false,
+the check is excluded from aggregate (project and tag) badges, and its
+single-check badge URL returns "404 Not Found".</p>
 </dd>
 <dt>methods</dt>
 <dd>

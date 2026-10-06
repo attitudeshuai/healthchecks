@@ -1199,6 +1199,30 @@ def badges(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     return render(request, "front/badges.html", ctx)
 
 
+@require_POST
+@login_required
+def badge_visibility(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    project = _get_rw_project_for_user(request, code)
+
+    # "visible" contains codes of checks which may appear in public badges.
+    # Every other check in the project gets public=False.
+    visible_codes: set[UUID] = set()
+    for raw in request.POST.getlist("visible"):
+        try:
+            visible_codes.add(UUID(raw))
+        except ValueError:
+            return HttpResponseBadRequest()
+
+    project.check_set.all().update(public=False)
+    if visible_codes:
+        project.check_set.filter(code__in=visible_codes).update(public=True)
+
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return HttpResponse()
+
+    return redirect("hc-badges", project.code)
+
+
 @login_required
 def channels(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project, rw = _get_project_for_user(request, code)
