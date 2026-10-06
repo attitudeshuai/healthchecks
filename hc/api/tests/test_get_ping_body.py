@@ -35,12 +35,31 @@ class GetPingBodyTestCase(BaseTestCase):
         r = self.client.get(self.url)
         self.assertContains(r, "missing api key", status_code=401)
 
-    def test_readonly_key_is_not_allowed(self) -> None:
+    def test_readonly_key_is_allowed(self) -> None:
         self.project.api_key_readonly = "R" * 32
         self.project.save()
 
         r = self.client.get(self.url, HTTP_X_API_KEY="R" * 32)
-        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"Foo\nBar\nBaz")
+
+    def test_readonly_key_cannot_write(self) -> None:
+        self.project.api_key_readonly = "R" * 32
+        self.project.save()
+
+        r = self.client.post(self.url, HTTP_X_API_KEY="R" * 32)
+        self.assertEqual(r.status_code, 405)
+
+    def test_readonly_key_respects_same_visibility_threshold(self) -> None:
+        self.project.api_key_readonly = "R" * 32
+        self.project.save()
+        self.check.n_pings = 101
+        self.check.save()
+
+        # Ping #1 is outside the ping log limit (100). The read-only key gets
+        # the same "explicitly missing" (404) result as the read-write key:
+        r = self.client.get(self.url, HTTP_X_API_KEY="R" * 32)
+        self.assertEqual(r.status_code, 404)
 
     def test_it_rejects_post(self) -> None:
         r = self.client.post(self.url, HTTP_X_API_KEY=self.project.api_key)

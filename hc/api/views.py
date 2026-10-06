@@ -12,7 +12,7 @@ from uuid import UUID
 
 from cronsim import CronSim, CronSimError
 from django.conf import settings
-from django.core.signing import BadSignature
+from django.core.signing import BadSignature, Signer
 from django.db import connection
 from django.db.models import Prefetch
 from django.db.models.functions import Length
@@ -37,7 +37,7 @@ from pydantic_core import PydanticCustomError
 
 from hc.accounts.models import Profile, Project
 from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
-from hc.api.forms import FlipsFiltersForm
+from hc.api.forms import FlipsFiltersForm, PingsFiltersForm
 from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
@@ -48,6 +48,53 @@ from hc.lib.tz import all_timezones, legacy_timezones
 class BadChannelException(Exception):
     def __init__(self, message: str):
         self.message = message
+
+
+# Default page size for the paginated pings API when "count" is not supplied:
+DEFAULT_PING_PAGE_SIZE = 100
+# Salt for signing "continue reading" cursors:
+PING_CURSOR_SALT = "hc.api.pings-cursor"
+# Query parameters which switch the pings endpoint into the paginated mode:
+PINGS_NEW_PARAMS = ("count", "cursor", "start", "end")
+
+
+class InvalidPingsCursor(Exception):
+    """The cursor is malformed, tampered with, or belongs to another check."""
+
+
+class StalePingsCursor(Exception):
+    """The cursor is valid but points at pings pruned by the retention policy."""
+
+
+def _sign_pings_cursor(code: UUID, last_id: int) -> str:
+    """Sign and serialize a "continue after this id" position."""
+    return Signer(salt=PING_CURSOR_SALT, sep=".").sign(f"{code.hex}:{last_id}")
+
+
+def _unsign_pings_cursor(token: str, check: Check) -> int:
+    """Verify the cursor and return the id to continue reading after.
+
+    Raises InvalidPingsCursor if the token is malformed/forged or references
+    another check, and StalePingsCursor if the referenced ping no longer exists
+    (because the retention policy has pruned it).
+    """
+    try:
+        payload = Signer(salt=PING_CURSOR_SALT, sep=".").unsign(token)
+        code_hex, sep, id_str = payload.partition(":")
+        if not sep:
+            raise ValueError
+        cursor_code = UUID(code_hex)
+        last_id = int(id_str)
+    except (BadSignature, ValueError):
+        raise InvalidPingsCursor()
+
+    if cursor_code != check.code or last_id < 1:
+        raise InvalidPingsCursor()
+
+    if not Ping.objects.filter(owner=check, id=last_id).exists():
+        raise StalePingsCursor()
+
+    return last_id
 
 
 def guess_kind(schedule: str) -> str:
@@ -592,37 +639,98 @@ def resume(request: ApiRequest, code: UUID) -> HttpResponse:
 
 @cors("GET")
 @csrf_exempt
-@authorize
+@authorize_read
 def pings(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    # Look up ping log limit from account's profile.
-    # There might be more pings in the database (depends on how pruning is handled)
-    # but we will not return more than the limit allows.
-    profile = Profile.objects.get(user__project=request.project)
-    # Cap the number of returned pings to 1000.
-    limit = min(profile.ping_log_limit, 1000)
+    def base_q() -> Any:
+        # Query in descending order so we're sure to get the most recent
+        # pings, regardless of any limits applied afterwards
+        q = Ping.objects.filter(owner=check).order_by("-id")
+        # Optimization: query just the length of body_raw instead of body_raw
+        # itself.
+        return q.defer("body_raw").annotate(body_raw_length=Length("body_raw"))
 
-    # Query in descending order so we're sure to get the most recent
-    # pings, regardless of the limit restriction
-    q = Ping.objects.filter(owner=check).order_by("-id")
-    # Optimization: query just the length of body_raw instead of body_raw itself.
-    q = q.defer("body_raw").annotate(body_raw_length=Length("body_raw"))
-    pings = list(q[:limit])
+    # When none of the pagination or time-window parameters is supplied we
+    # preserve the legacy behavior (and the legacy response shape) exactly:
+    # return the most recent batch capped by the account limit and 1000.
+    if not any(k in request.GET for k in PINGS_NEW_PARAMS):
+        # Look up ping log limit from account's profile.
+        # There might be more pings in the database (depends on how pruning is
+        # handled) but we will not return more than the limit allows.
+        profile = Profile.objects.get(user__project=request.project)
+        # Cap the number of returned pings to 1000.
+        limit = min(profile.ping_log_limit, 1000)
 
-    prepare_durations(pings)
+        pings_ = list(base_q()[:limit])
+        prepare_durations(pings_)
 
-    # Pass check's code to Ping.to_dict(), so it does not need to look it up
-    # (which would result in a database query)
-    ping_dicts = [p.to_dict(owner_code=check.code, v=request.v) for p in pings]
-    return JsonResponse({"pings": ping_dicts})
+        # Pass check's code to Ping.to_dict(), so it does not need to look it up
+        # (which would result in a database query)
+        ping_dicts = [p.to_dict(owner_code=check.code, v=request.v) for p in pings_]
+        return JsonResponse({"pings": ping_dicts})
+
+    form = PingsFiltersForm(request.GET)
+    if not form.is_valid():
+        return JsonResponse({"error": form.first_error()}, status=400)
+
+    page_size = form.cleaned_data["count"] or DEFAULT_PING_PAGE_SIZE
+
+    q = base_q()
+
+    if cursor_token := form.cleaned_data["cursor"]:
+        try:
+            last_id = _unsign_pings_cursor(cursor_token, check)
+        except InvalidPingsCursor:
+            return JsonResponse({"error": "invalid cursor"}, status=400)
+        except StalePingsCursor:
+            return JsonResponse(
+                {
+                    "error": (
+                        "cursor is no longer valid, the pings it points at have "
+                        "been pruned by the retention policy; re-request the first "
+                        "page without the cursor to continue from the oldest "
+                        "currently available ping"
+                    )
+                },
+                status=409,
+            )
+        # Keyset pagination: only return rows strictly older than the last row
+        # of the previous page. New rows inserted while the caller pages have
+        # higher ids, so already-served pages can never shift or repeat.
+        q = q.filter(id__lt=last_id)
+
+    if start := form.cleaned_data["start"]:
+        q = q.filter(created__gte=start)
+
+    if end := form.cleaned_data["end"]:
+        q = q.filter(created__lt=end)
+
+    # Fetch one extra row so we can tell whether further pages remain:
+    pings_ = list(q[: page_size + 1])
+    has_more = len(pings_) > page_size
+    if has_more:
+        pings_ = pings_[:page_size]
+
+    prepare_durations(pings_)
+
+    ping_dicts = [p.to_dict(owner_code=check.code, v=request.v) for p in pings_]
+    return JsonResponse(
+        {
+            "pings": ping_dicts,
+            "next_cursor": (
+                _sign_pings_cursor(check.code, pings_[-1].id) if has_more else None
+            ),
+            "done": not has_more,
+        }
+    )
 
 
 @cors("GET")
 @csrf_exempt
-@authorize
+@authorize_read
 def ping_body(request: ApiRequest, code: UUID, n: int) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:

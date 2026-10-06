@@ -58,6 +58,8 @@ read-only key
 
     * [List existing checks](#list-checks)
     * [Get a single check](#get-check)
+    * [List check's logged pings](#list-pings)
+    * [Get a ping's logged body](#ping-body)
     * [List check's status changes](#list-flips)
     * [List project's badges](#list-badges)
 
@@ -1238,14 +1240,54 @@ curl SITE_ROOT/api/v3/checks/7918b17b-a745-4db1-8575-9d2e07c97f79 \
 
 Returns a list of pings this check has received.
 
-This endpoint returns pings in reverse order (most recent first), and the total
-number of returned pings depends on the account's billing plan: 100 for free accounts,
-1000 for paid accounts.
+This endpoint returns pings in reverse order (most recent first). It accepts
+both the read-write and the read-only API keys.
+
+When no query parameters are supplied, the endpoint returns just the most recent
+batch of pings: 100 for free accounts, 1000 for paid accounts. To read the full
+history in stable, repeatable pages, use the `count` and `cursor` query
+parameters described below.
+
+### Query Parameters
+
+count=&lt;value&gt;
+:   Returns at most `value` pings per page. Must be an integer between 1 and 1000.
+    Out-of-range or non-integer values produce a 400 response, the value is never
+    silently truncated. The page size is not capped by the account's ping log
+    limit. If omitted in a paginated request, it defaults to 100.
+
+    Example:
+
+    `SITE_ROOT/api/v3/checks/<uuid>/pings/?count=100`
+
+cursor=&lt;value&gt;
+:   Continues reading from the position encoded in the opaque `next_cursor`
+    value received in a previous response. Each cursor is bound to its check and
+    is signed by the server. Paging is keyed on individual pings: pings received
+    while the caller is paging can only appear at the beginning of the history
+    and can never shift, duplicate or remove items from already-served pages.
+    A malformed or tampered cursor produces a 400 response. If the pings at the
+    cursor position have since been pruned by the retention policy, the API
+    returns a 409 response; re-request the first page (without the cursor) to
+    continue from the oldest currently available ping.
+
+start=&lt;value&gt;
+:   Returns pings received at or after the specified UNIX timestamp (seconds,
+    interpreted in UTC).
+
+end=&lt;value&gt;
+:   Returns pings received before the specified UNIX timestamp (seconds,
+    interpreted in UTC). If `start` is greater than `end`, the API returns a
+    400 response. `start` equal to `end`, or a window containing no pings,
+    produces an empty `pings` list with `done` set to `true`.
 
 ### Response Codes
 
 200 OK
 :   The request succeeded.
+
+400 Bad Request
+:   An invalid query parameter or cursor was supplied.
 
 401 Unauthorized
 :   The API key is either missing or invalid.
@@ -1255,6 +1297,10 @@ number of returned pings depends on the account's billing plan: 100 for free acc
 
 404 Not Found
 :   The specified check does not exist.
+
+409 Conflict
+:   The cursor is valid but references pings that have been pruned by the
+    retention policy. Restart from the first page without the cursor.
 
 ### Example Request
 
@@ -1318,6 +1364,35 @@ curl SITE_ROOT/api/v3/checks/f618072a-7bde-4eee-af63-71a77c5723bc/pings/ \
 }
 ```
 
+### Example Paginated Response
+
+When any of `count`, `cursor`, `start` or `end` is supplied, the response also
+includes a `next_cursor` field and a `done` field. Pass the received
+`next_cursor` value back in the next request to read the next, older page.
+`done` is `true` on the final page, and then `next_cursor` is `null`. Walking
+the returned cursors page by page covers the complete history without gaps or
+duplicates.
+
+```json
+{
+  "pings": [
+    {
+      "type": "success",
+      "date": "2020-06-09T14:51:06.113073+00:00",
+      "n": 4,
+      "scheme": "http",
+      "remote_addr": "192.0.2.0",
+      "method": "GET",
+      "ua": "curl/7.68.0",
+      "rid": null,
+      "body_url": null
+    }
+  ],
+  "next_cursor": "f618072a7bde4eeeaf6371a77c5723bc:12490.AbCdEfGhIjKlM",
+  "done": false
+}
+```
+
 
 ## Get a ping's logged body {: #ping-body .rule }
 
@@ -1326,10 +1401,17 @@ curl SITE_ROOT/api/v3/checks/f618072a-7bde-4eee-af63-71a77c5723bc/pings/ \
 Returns a ping's logged body. The response always has the `Content-Type: text/plain`
 response header and the ping body is returned verbatim in the response body.
 
+This endpoint accepts both the read-write and the read-only API keys. Both key
+types have the same visibility range: pings outside of the account's ping log
+limit return 404.
+
 ### Response Codes
 
 200 OK
 :   The request succeeded and a body is present.
+
+401 Unauthorized
+:   The API key is either missing or invalid.
 
 403 Forbidden
 :   Access denied, wrong API key.
