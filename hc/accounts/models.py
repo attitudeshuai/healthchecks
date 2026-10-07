@@ -3,10 +3,11 @@ from __future__ import annotations
 import hmac
 import random
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime
 from datetime import timedelta as td
 from secrets import token_urlsafe
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generator
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
@@ -14,7 +15,7 @@ from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import User
 from django.core.signing import BadSignature, TimestampSigner
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q, QuerySet
 from django.db.models.functions import Lower
 from django.template.loader import render_to_string
@@ -56,6 +57,19 @@ DELETION_GRACE = td(days=31)
 def month(dt: datetime) -> date:
     """For a given datetime, return the matching first-day-of-month date."""
     return dt.date().replace(day=1)
+
+
+class QuotaExceeded(Exception):
+    """Raised when an account-level quota would be exceeded.
+
+    The atomic reserve/deduct helpers raise this instead of silently going
+    through, so callers can surface a readable rejection to the user.
+    `reason` always contains a human-readable explanation.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 class ProfileManager(models.Manager["Profile"]):
@@ -302,16 +316,34 @@ class Profile(models.Model):
         return self.sms_sent
 
     def authorize_sms(self) -> bool:
-        """If monthly limit not exceeded, increase counter and return True"""
+        """Atomically consume one SMS from the monthly quota.
 
-        sent_this_month = self.sms_sent_this_month()
-        if sent_this_month >= self.sms_limit:
-            return False
+        Takes a row lock on the profile inside a transaction, evaluates the
+        counter based on the locked values, and writes the new counter back
+        in the same transaction. Concurrent calls serialize on the lock, so
+        the monthly limit can never be overshot, and a rejected call leaves
+        the persisted counter untouched.
+        """
 
-        self.sms_sent = sent_this_month + 1
-        self.last_sms_date = now()
-        self.save()
-        return True
+        with transaction.atomic():
+            p = Profile.objects.select_for_update().get(pk=self.pk)
+            frozen_now = now()
+            if not p.last_sms_date or month(frozen_now) > month(p.last_sms_date):
+                sent_this_month = 0
+            else:
+                sent_this_month = p.sms_sent
+
+            if sent_this_month >= p.sms_limit:
+                return False
+
+            p.sms_sent = sent_this_month + 1
+            p.last_sms_date = frozen_now
+            p.save(update_fields=["sms_sent", "last_sms_date"])
+
+            # Keep the in-memory instance in sync with the locked row
+            self.sms_sent = p.sms_sent
+            self.last_sms_date = p.last_sms_date
+            return True
 
     def calls_sent_this_month(self) -> int:
         # IF last_call_date was never set, we have not made any phone calls yet.
@@ -325,16 +357,34 @@ class Profile(models.Model):
         return self.calls_sent
 
     def authorize_call(self) -> bool:
-        """If monthly limit not exceeded, increase counter and return True"""
+        """Atomically consume one phone call from the monthly quota.
 
-        sent_this_month = self.calls_sent_this_month()
-        if sent_this_month >= self.call_limit:
-            return False
+        Takes a row lock on the profile inside a transaction, evaluates the
+        counter based on the locked values, and writes the new counter back
+        in the same transaction. Concurrent calls serialize on the lock, so
+        the monthly limit can never be overshot, and a rejected call leaves
+        the persisted counter untouched.
+        """
 
-        self.calls_sent = sent_this_month + 1
-        self.last_call_date = now()
-        self.save()
-        return True
+        with transaction.atomic():
+            p = Profile.objects.select_for_update().get(pk=self.pk)
+            frozen_now = now()
+            if not p.last_call_date or month(frozen_now) > month(p.last_call_date):
+                sent_this_month = 0
+            else:
+                sent_this_month = p.calls_sent
+
+            if sent_this_month >= p.call_limit:
+                return False
+
+            p.calls_sent = sent_this_month + 1
+            p.last_call_date = frozen_now
+            p.save(update_fields=["calls_sent", "last_call_date"])
+
+            # Keep the in-memory instance in sync with the locked row
+            self.calls_sent = p.calls_sent
+            self.last_call_date = p.last_call_date
+            return True
 
     def num_checks_used(self) -> int:
         from hc.api.models import Check
@@ -346,6 +396,35 @@ class Profile(models.Model):
 
     def can_accept(self, project: Project) -> bool:
         return project.check_set.count() <= self.num_checks_available()
+
+    @contextmanager
+    def reserve_check_slot(self) -> Generator[None, None, None]:
+        """Reserve one check-creation slot for this account, atomically.
+
+        Opens a transaction, takes a row lock on this profile row, and only
+        then counts the existing checks against `check_limit`. The actual
+        Check row must be inserted while still inside this context, so the
+        quota check and the insert are covered by the same transaction and
+        the same lock. Concurrent creations for the same account (including
+        across its projects) serialize here, and the total number of checks
+        can never go above the limit.
+
+        Raises QuotaExceeded (without inserting anything) if the account is
+        already at its limit. A lowered limit takes effect immediately;
+        already-existing over-limit checks are left untouched.
+        """
+
+        from hc.api.models import Check
+
+        with transaction.atomic():
+            Profile.objects.select_for_update().get(pk=self.pk)
+            used = Check.objects.filter(project__owner_id=self.user_id).count()
+            if used >= self.check_limit:
+                raise QuotaExceeded(
+                    f"check quota exhausted: {used} of {self.check_limit} "
+                    "check slots already in use"
+                )
+            yield
 
     def update_next_nag_date(self) -> None:
         any_down = self.checks_from_all_projects().filter(status="down").exists()

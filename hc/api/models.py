@@ -1584,3 +1584,100 @@ class TokenBucket(models.Model):
         # Use force=True, we are recording the S3 error after the error already
         # happened, and want to record it even if the tokens field would go negative.
         TokenBucket.authorize("s3_get_object_error", 3, 60, force=True)
+
+
+class RateLimitConfig(models.Model):
+    """Singleton (pk=1) holding the write-rate-limiting configuration.
+
+    A row with all fields filled in enables limiting and takes precedence
+    over the WRITE_RATE_LIMIT setting from the configuration file. A row
+    with blank fields means "not configured here" and makes the system fall
+    back to the configuration-file value (which itself may be unset, in
+    which case limiting is disabled entirely).
+    """
+
+    class Scope(models.TextChoices):
+        PROJECT = "project", "Per project"
+        ACCOUNT = "account", "Per account (project owner)"
+
+    scope = models.CharField(max_length=10, blank=True, choices=Scope.choices)
+    limit = models.PositiveIntegerField(null=True, blank=True)
+    window_secs = models.PositiveIntegerField(null=True, blank=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    SINGLETON_ID = 1
+
+    class Meta:
+        # Keep a tiny, stable table name even though we never expect more
+        # than one row:
+        verbose_name = "write rate limit configuration"
+
+    def __str__(self) -> str:
+        if self.is_configured:
+            return f"{self.limit} writes / {self.window_secs}s per {self.scope}"
+        return "write rate limiting not configured"
+
+    @classmethod
+    def load(cls) -> RateLimitConfig | None:
+        """Return the singleton configuration row, if it has been created."""
+        return cls.objects.filter(pk=cls.SINGLETON_ID).first()
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.scope) and self.limit is not None and self.window_secs is not None
+
+    def clean(self) -> None:
+        """Validate the configuration.
+
+        Either all fields are blank (disabled here, fall back to the config
+        file), or all of them must hold valid values. Invoked by the admin
+        form on every save, so invalid values are rejected before the row is
+        written and the previous configuration stays in effect.
+        """
+
+        from django.core.exceptions import ValidationError
+
+        if not self.scope and self.limit is None and self.window_secs is None:
+            return
+
+        errors: dict[str, ValidationError] = {}
+        if self.scope not in RateLimitConfig.Scope.values:
+            errors["scope"] = ValidationError(
+                "scope must be 'project' or 'account'", code="invalid_scope"
+            )
+        if self.limit is None or self.limit < 0:
+            errors["limit"] = ValidationError(
+                "limit must be a non-negative integer", code="invalid_limit"
+            )
+        if self.window_secs is None or self.window_secs < 1:
+            errors["window_secs"] = ValidationError(
+                "window duration must be a positive integer (seconds)",
+                code="invalid_window",
+            )
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        # There is only ever one configuration row:
+        self.pk = self.SINGLETON_ID
+        super().save(*args, **kwargs)
+
+
+class RateLimitCounter(models.Model):
+    """Number of write requests consumed in one fixed time window.
+
+    One row per (scope dimension, scope id, window index). The window index
+    is embedded into `value` (for example "write-p-42-19283"), so a new
+    window naturally starts a new row without overwriting the old one. The
+    increment is performed while holding a row lock inside a transaction.
+    """
+
+    value = models.CharField(max_length=80, unique=True)
+    count = models.PositiveIntegerField(default=0)
+    window_start = models.DateTimeField()
+
+    class Meta:
+        indexes = (models.Index(fields=["window_start"]),)
+
+    def __str__(self) -> str:
+        return f"{self.value}: {self.count}"

@@ -35,10 +35,17 @@ from oncalendar import OnCalendar, OnCalendarError
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from hc.accounts.models import Profile, Project
-from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
+from hc.accounts.models import Profile, Project, QuotaExceeded
+from hc.api.decorators import (
+    ApiRequest,
+    authorize,
+    authorize_read,
+    cors,
+    write_rate_limited,
+)
 from hc.api.forms import FlipsFiltersForm
 from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
+from hc.api.ratelimit import current_window
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
@@ -435,24 +442,50 @@ def get_checks(request: ApiRequest) -> JsonResponse:
     return JsonResponse({"checks": checks})
 
 
+@cors("GET")
+@csrf_exempt
+@authorize_read
+def rate_limit_status(request: ApiRequest) -> HttpResponse:
+    """Report the current write-rate-limit window without consuming a slot.
+
+    Read-only API keys are accepted. Shows the active scope/limit, the used
+    and remaining slot counts and the current window's start/end timestamps.
+    This endpoint itself is never rate limited and does not create counter
+    rows.
+    """
+
+    state = current_window(request.project, consume=False)
+    if state is None:
+        return JsonResponse({"enabled": False})
+
+    return JsonResponse({"enabled": True, **state.to_dict()})
+
+
 @authorize
+@write_rate_limited
 def create_check(request: ApiRequest) -> HttpResponse:
     try:
         spec = Spec.model_validate(request.json, strict=True)
     except ValidationError as e:
         return JsonResponse({"error": format_first_error(e)}, status=400)
 
-    created = False
     check = _lookup(request.project, spec)
-    if check is None:
-        if request.project.num_checks_available() <= 0:
-            return HttpResponseForbidden()
-
-        check = Check(project=request.project)
-        created = True
+    created = False
 
     try:
-        _update(check, spec, request.v)
+        if check is None:
+            # Quota check and row creation must happen in the same transaction
+            # and on the same (profile) lock, otherwise concurrent creates can
+            # both pass the check and overshoot the account's limit:
+            profile = Profile.objects.get(user_id=request.project.owner_id)
+            with profile.reserve_check_slot():
+                check = Check(project=request.project)
+                _update(check, spec, request.v)
+            created = True
+        else:
+            _update(check, spec, request.v)
+    except QuotaExceeded as e:
+        return JsonResponse({"error": e.reason}, status=403)
     except BadChannelException as e:
         return JsonResponse({"error": e.message}, status=400)
 
@@ -497,6 +530,7 @@ def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpRespons
 
 
 @authorize
+@write_rate_limited
 def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
@@ -518,6 +552,7 @@ def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
 
 
 @authorize
+@write_rate_limited
 def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
     # Don't acquire lock right away, first see if the check exists
     # and matches the API key
@@ -544,6 +579,7 @@ def single(request: HttpRequest, code: UUID) -> HttpResponse:
 @cors("POST")
 @csrf_exempt
 @authorize
+@write_rate_limited
 def pause(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
@@ -571,6 +607,7 @@ def pause(request: ApiRequest, code: UUID) -> HttpResponse:
 @cors("POST")
 @csrf_exempt
 @authorize
+@write_rate_limited
 def resume(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:

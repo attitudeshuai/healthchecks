@@ -40,7 +40,7 @@ from django_stubs_ext import WithAnnotations
 from oncalendar import OnCalendar, OnCalendarError
 
 from hc.accounts.http import AuthenticatedHttpRequest
-from hc.accounts.models import Member, Profile, Project
+from hc.accounts.models import Member, Profile, Project, QuotaExceeded
 from hc.api.models import (
     DEFAULT_GRACE,
     DEFAULT_TIMEOUT,
@@ -51,6 +51,7 @@ from hc.api.models import (
     Ping,
     prepare_durations,
 )
+from hc.api.ratelimit import enforce_write_rate_limit
 from hc.front import forms
 from hc.front.templatetags.hc_extras import (
     down_title,
@@ -67,6 +68,8 @@ from hc.lib.urls import absolute_reverse
 logger = logging.getLogger(__name__)
 
 VALID_SORT_VALUES = ("name", "-name", "last_ping", "-last_ping", "created")
+# HTTP methods that never mutate state and so must not be write-rate-limited
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 STATUS_TEXT_TMPL = get_template("front/log_status_text.html")
 LAST_PING_TMPL = get_template("front/last_ping_cell.html")
 EVENTS_TMPL = get_template("front/details_events.html")
@@ -141,6 +144,12 @@ def _get_rw_check_for_user(request: HttpRequest, code: UUID) -> Check:
     if not rw:
         raise PermissionDenied
 
+    # This helper is the common choke point for all check-mutating views
+    # (create/update/delete/pause/resume/copy/...). Count the write against
+    # the project's write rate limit; reads (form rendering) are exempt.
+    if request.method not in SAFE_METHODS:
+        enforce_write_rate_limit(check.project, request)
+
     return check
 
 
@@ -164,6 +173,10 @@ def _get_rw_channel_for_user(request: HttpRequest, code: UUID) -> Channel:
     channel, rw = _get_channel_for_user(request, code)
     if not rw:
         raise PermissionDenied
+
+    # Channel write views (rename, remove, edit) all go through here.
+    if request.method not in SAFE_METHODS:
+        enforce_write_rate_limit(channel.project, request)
 
     return channel
 
@@ -189,6 +202,12 @@ def _get_rw_project_for_user(request: HttpRequest, code: UUID) -> Project:
     project, rw = _get_project_for_user(request, code)
     if not rw:
         raise PermissionDenied
+
+    # Adding checks and adding any integration channel all funnel through
+    # this helper, so account/project-scoped write limiting applies to the
+    # whole authenticated write surface uniformly.
+    if request.method not in SAFE_METHODS:
+        enforce_write_rate_limit(project, request)
 
     return project
 
@@ -528,8 +547,6 @@ def docs_cron(request: HttpRequest) -> HttpResponse:
 @login_required
 def add_check(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
-    if project.num_checks_available() <= 0:
-        return HttpResponseBadRequest()
 
     form = forms.AddCheckForm(request.POST)
     if not form.is_valid():
@@ -544,9 +561,17 @@ def add_check(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check.schedule = form.cleaned_data["schedule"]
     check.tz = form.cleaned_data["tz"]
     check.grace = form.cleaned_data["grace"]
-    check.save()
 
-    check.assign_all_channels()
+    # The quota check and the insert run in the same transaction and on the
+    # same profile lock, so concurrent submits cannot create more checks than
+    # the account's limit allows:
+    profile = Profile.objects.get(user_id=project.owner_id)
+    try:
+        with profile.reserve_check_slot():
+            check.save()
+            check.assign_all_channels()
+    except QuotaExceeded as e:
+        return HttpResponseBadRequest(e.reason)
 
     url = reverse("hc-checks", args=[project.code])
     url += _get_referer_qs(request)  # Preserve selected tags and search
@@ -1078,9 +1103,6 @@ def transfer(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
 def copy(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
-    if check.project.num_checks_available() <= 0:
-        return HttpResponseBadRequest()
-
     new_name = check.name + " (copy)"
     # Make sure we don't exceed the 100 character db field limit:
     if len(new_name) > 100:
@@ -1109,9 +1131,15 @@ def copy(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     copied.kind = check.kind
     copied.timeout, copied.grace = check.timeout, check.grace
     copied.schedule, copied.tz = check.schedule, check.tz
-    copied.save()
 
-    copied.channel_set.add(*check.channel_set.all())
+    # Same atomic quota lock as the regular create path:
+    profile = Profile.objects.get(user_id=check.project.owner_id)
+    try:
+        with profile.reserve_check_slot():
+            copied.save()
+            copied.channel_set.add(*check.channel_set.all())
+    except QuotaExceeded as e:
+        return HttpResponseBadRequest(e.reason)
 
     url = reverse("hc-details", args=[copied.code], query={"copied": 1})
     return redirect(url)
@@ -1154,6 +1182,8 @@ def badges(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project, _rw = _get_project_for_user(request, code)
 
     if request.method == "POST":
+        # This POST only renders a badge preview, it does not persist
+        # anything, so it is treated as a read and not rate-limited.
         form = forms.BadgeSettingsForm(request.POST)
         if not form.is_valid():
             return HttpResponseBadRequest()
@@ -1206,6 +1236,8 @@ def channels(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     if request.method == "POST":
         if not rw:
             return HttpResponseForbidden()
+
+        enforce_write_rate_limit(project, request)
 
         channel_code = request.POST.get("channel", "")
         if not is_valid_uuid_string(channel_code):

@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import date
 from datetime import timedelta as td
-from typing import ClassVar, TypedDict
+from typing import Any, ClassVar, TypedDict
 from uuid import UUID
 
 from django.contrib import admin
 from django.contrib.admin import ModelAdmin
 from django.core.paginator import Paginator
+from django.forms.models import ModelForm
 from django.db.models import F, QuerySet
 from django.http import HttpRequest
 from django.urls import reverse
@@ -16,7 +17,15 @@ from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from django_stubs_ext import WithAnnotations
 
-from hc.api.models import Channel, Check, Flip, Notification, Ping
+from hc.api.models import (
+    Channel,
+    Check,
+    Flip,
+    Notification,
+    Ping,
+    RateLimitConfig,
+    RateLimitCounter,
+)
 from hc.lib.date import format_duration
 
 Lookups = Iterable[tuple[str, str]]
@@ -324,3 +333,50 @@ class NotificationsAdmin(ModelAdmin[Notification]):
 class FlipsAdmin(ModelAdmin[Flip]):
     list_display = ("id", "created", "processed", "owner", "old_status", "new_status")
     raw_id_fields = ("owner",)
+
+
+@admin.register(RateLimitConfig)
+class RateLimitConfigAdmin(ModelAdmin[RateLimitConfig]):
+    fields = ("scope", "limit", "window_secs")
+    list_display = ("scope", "limit", "window_secs", "updated")
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        # Singleton: allow creating the row only if it does not exist yet
+        return not RateLimitConfig.objects.exists()
+
+    def has_delete_permission(
+        self, request: HttpRequest, obj: RateLimitConfig | None = None
+    ) -> bool:
+        # Deleting the configuration would silently switch the limiter off
+        return False
+
+    def get_form(
+        self,
+        request: HttpRequest,
+        obj: RateLimitConfig | None = None,
+        change: bool = False,
+        **kwargs: Any,
+    ) -> type[ModelForm[RateLimitConfig]]:
+        form = super().get_form(request, obj, change, **kwargs)
+        form.base_fields["scope"].help_text = (
+            "'project' counts writes per project, 'account' per project owner. "
+            "Leave all fields blank to fall back to the WRITE_RATE_LIMIT setting."
+        )
+        form.base_fields["limit"].help_text = (
+            "Maximum write requests allowed in each window. Must not be negative."
+        )
+        form.base_fields["window_secs"].help_text = (
+            "Fixed window length in seconds. Must be greater than zero."
+        )
+        return form
+
+
+@admin.register(RateLimitCounter)
+class RateLimitCountersAdmin(ModelAdmin[RateLimitCounter]):
+    list_display = ("value", "count", "window_start")
+    list_filter = ("window_start",)
+    ordering = ("-window_start",)
+    readonly_fields = ("value", "count", "window_start")
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False

@@ -151,6 +151,7 @@ MIDDLEWARE = [
 
 if envbool("USE_GZIP_MIDDLEWARE", "False"):
     MIDDLEWARE.append("django.middleware.gzip.GZipMiddleware")
+MIDDLEWARE.append("hc.api.middleware.WriteRateLimitMiddleware")
 
 AUTHENTICATION_BACKENDS = [
     "hc.accounts.backends.EmailBackend",
@@ -446,6 +447,44 @@ INTEGRATIONS_ALLOW_PRIVATE_IPS = envbool("INTEGRATIONS_ALLOW_PRIVATE_IPS", "Fals
 # Zulip
 ZULIP_ENABLED = envbool("ZULIP_ENABLED", "True")
 
+
+# Write rate limiting for authenticated write endpoints (new/update/delete/
+# pause/resume checks and channel configuration writes). Off by default.
+# Configure either here (WRITE_RATE_LIMIT = (scope, limit, window_secs)) or
+# through the WRITE_RATE_LIMIT_* environment variables, or at runtime in the
+# admin (admin configuration takes precedence when set).
+# scope: "project" counts against the project, "account" against the
+# project owner's account. Read endpoints and inbound pings are never limited.
+def _write_rate_limit_from_env() -> tuple[str, int, int] | None:
+    scope = os.getenv("WRITE_RATE_LIMIT_SCOPE")
+    limit_raw = os.getenv("WRITE_RATE_LIMIT_LIMIT")
+    window_raw = os.getenv("WRITE_RATE_LIMIT_WINDOW")
+    if scope is None and limit_raw is None and window_raw is None:
+        return None
+
+    if scope not in ("project", "account"):
+        raise ImproperlyConfigured(
+            "WRITE_RATE_LIMIT_SCOPE must be 'project' or 'account'"
+        )
+    try:
+        limit = int(limit_raw)  # type: ignore[arg-type]
+        window_secs = int(window_raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ImproperlyConfigured(
+            "WRITE_RATE_LIMIT_LIMIT and WRITE_RATE_LIMIT_WINDOW must be integers"
+        )
+    if limit < 0:
+        raise ImproperlyConfigured("WRITE_RATE_LIMIT_LIMIT must not be negative")
+    if window_secs < 1:
+        raise ImproperlyConfigured(
+            "WRITE_RATE_LIMIT_WINDOW must be a positive number of seconds"
+        )
+
+    return scope, limit, window_secs
+
+
+WRITE_RATE_LIMIT = _write_rate_limit_from_env()
+
 # Read additional configuration from hc/local_settings.py if it exists
 if (BASE_DIR / "hc/local_settings.py").exists():
     from .local_settings import *
@@ -454,6 +493,15 @@ if (BASE_DIR / "hc/local_settings.py").exists():
 if sys.argv[1:2] == ["test"]:
     # For speed:
     PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+    if DATABASES["default"]["ENGINE"] == "django.db.backends.sqlite3":
+        # Use a file-based test database instead of the default in-memory
+        # shared-cache one. Shared-cache in-memory databases reject concurrent
+        # writers from other connections immediately ("database table is
+        # locked"), which makes genuine multi-threaded concurrency tests
+        # impossible. On a file database, BEGIN IMMEDIATE serializes writers
+        # (honoring busy_timeout), matching production behavior.
+        DATABASES["default"].setdefault("TEST", {})
+        DATABASES["default"]["TEST"]["NAME"] = BASE_DIR / "test_hc.sqlite3"
     # Send emails synchronously
     BLOCKING_EMAILS = True
     # Make sure MAILERS is set as hc.lib.emails.send() requires it

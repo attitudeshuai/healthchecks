@@ -8,6 +8,12 @@ from typing import Any
 from django.http import HttpRequest, HttpResponse, JsonResponse
 
 from hc.accounts.models import Project
+from hc.api.ratelimit import (
+    RateLimitExceeded,
+    annotate_response,
+    enforce_write_rate_limit,
+    rejected_response,
+)
 from hc.lib.typealias import ViewFunc
 
 
@@ -89,6 +95,31 @@ def authorize_read(f: ViewFunc) -> ViewFunc:
         )
         request.v = _get_api_version(request)
         return f(request, *args, **kwds)
+
+    return wrapper
+
+
+def write_rate_limited(f: ViewFunc) -> ViewFunc:
+    """Apply the configurable write rate limit to an authenticated view.
+
+    Must wrap the view *inside* @authorize, so request.project is already
+    resolved. On rejection the response has the same {"error": ...} shape as
+    the other API errors, plus a Retry-After header with the seconds to wait.
+    Accepted responses carry X-RateLimit-* headers describing the window.
+    When limiting is not configured, the view behaves exactly as before.
+    """
+
+    @wraps(f)
+    def wrapper(request: ApiRequest, *args: Any, **kwds: Any) -> HttpResponse:
+        try:
+            state = enforce_write_rate_limit(request.project, request)
+        except RateLimitExceeded as e:
+            return rejected_response(e.state, json_shape=True)
+
+        response = f(request, *args, **kwds)
+        if state is not None:
+            annotate_response(response, state)
+        return response
 
     return wrapper
 
